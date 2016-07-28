@@ -3,7 +3,6 @@ from .resolweapi import ResolweAPI
 from .tools import to_orange_table, transpose_table
 
 
-
 def connect(username, password, url, server_type):
     """ Connect to Resolwe server
     Args:
