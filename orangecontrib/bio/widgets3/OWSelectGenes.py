@@ -4,6 +4,7 @@ import re
 import unicodedata
 import operator
 import math
+import numpy as np
 from collections import defaultdict, namedtuple
 from operator import itemgetter
 from functools import reduce
@@ -108,13 +109,16 @@ class OWSelectGenes(widget.OWWidget):
 
     settingsHandler = settings.DomainContextHandler()
 
+    useColumns = settings.ContextSetting(False)
     geneIndex = settings.ContextSetting(0)
     taxid = settings.ContextSetting(None)
     subsetGeneIndex = settings.ContextSetting(-1)
 
+
     savedSelections = settings.Setting([
         ("Example", ["MRE11A", "RAD51", "MLH1", "MSH2", "DMC1"])
     ])
+
     selectedSource = settings.Setting(SelectCustom)
     selectedSelectionIndex = settings.Setting(-1)
     completeOnSymbols = settings.Setting(True)
@@ -152,13 +156,26 @@ class OWSelectGenes(widget.OWWidget):
         self._executor = ThreadExecutor()
 
         self._infotask = None
-
+        """
         box = gui.widgetBox(self.controlArea, "Gene Attribute")
         box.setToolTip("Column with gene names")
         self.attrsCombo = gui.comboBox(
             box, self, "geneIndex",
             callback=self._onGeneIndexChanged,
         )
+
+        """
+        genebox = gui.widgetBox(self.controlArea, "Gene Attribute")
+        self.attrsCombo = gui.comboBox(
+            genebox, self, "geneIndex", callback=self._onGeneIndexChanged,
+            tooltip="Column with gene names")
+        self.attrsCombo.setDisabled(self.useColumns)
+
+        cb = gui.checkBox(genebox, self, "useColumns", "Genes as columns",
+                          tooltip="Use column names for gene names",
+                          callback=self._onGeneIndexChanged)
+        cb.toggled[bool].connect(self.attrsCombo.setDisabled)
+
         self.attrsCombo.setModel(self.variables)
 
         box = gui.widgetBox(self.controlArea, "Gene Selection")
@@ -456,25 +473,31 @@ class OWSelectGenes(widget.OWWidget):
                 self.taxid = taxid
                 self._updateGeneInfo()
 
+    def gene_attribute_selection(self):
+        self.warning(0)
+        self.variables[:] = []
+        self.geneIndex = -1
+        self.attrsCombo.setModel(self.variables)
+
+        if self.data is not None:
+            if not self.useColumns:
+                attrs = gene_candidates(self.data)
+                self.variables[:] = attrs
+                self.attrsCombo.setCurrentIndex(0)
+                if attrs:
+                    self.geneIndex = 0
+                else:
+                    self.geneIndex = -1
+                    self.warning(0, "No suitable columns for gene names.")
+
+
     def setData(self, data):
         """
         Set the input data.
         """
         self.closeContext()
-        self.warning(0)
         self.data = data
-        if data is not None:
-            attrs = gene_candidates(data)
-            self.variables[:] = attrs
-            self.attrsCombo.setCurrentIndex(0)
-            if attrs:
-                self.geneIndex = 0
-            else:
-                self.geneIndex = -1
-                self.warning(0, "No suitable columns for gene names.")
-        else:
-            self.variables[:] = []
-            self.geneIndex = -1
+        self.gene_attribute_selection()
 
         self._changedFlag = True
 
@@ -562,6 +585,7 @@ class OWSelectGenes(widget.OWWidget):
         selection = []
         if self.selectedSource == OWSelectGenes.SelectInput:
             var = self.subsetGeneVar
+
             if var is not None:
                 assert isinstance(var, Orange.data.StringVariable)
                 values = [inst[var] for inst in self.subsetData]
@@ -575,17 +599,22 @@ class OWSelectGenes(widget.OWWidget):
         Send the selected data subset to the output.
         """
         selection = self.selectedGenes()
+        data = None
 
         if self.geneinfo[1] is not None:
             backmap = dict((info.symbol, name) for name, info in self.genes
                            if info is not None)
             selection = [backmap.get(name, name) for name in selection]
-        if self.geneVar is not None:
-            data = select_by_genes(self.data, self.geneVar,
-                                   gene_list=selection,
-                                   preserve_order=self.preserveOrder)
+
+        if not self.useColumns:
+
+            if self.geneVar is not None:
+                data = select_by_genes(self.data, self.geneVar,
+                                           gene_list=selection,
+                                           preserve_order=self.preserveOrder)
         else:
-            data = None
+            if self.data:
+                data = select_by_columns(self.data, gene_list=selection)
 
         self.send("Selected Data", data)
         self._changedFlag = False
@@ -606,21 +635,27 @@ class OWSelectGenes(widget.OWWidget):
             self.invalidateOutput()
 
     def _updateCompletionModel(self):
-        var = self.geneVar
-        if var is not None:
-            assert isinstance(var, Orange.data.StringVariable)
-            names, _ = self.data.get_column_view(var)
-            if names.dtype == object:
-                names = [name for name in names if isinstance(name, str)]
-            elif names.dtype.kind in ["U", "S"]:
-                names = [str(name) for name in names]
-            else:
-                raise TypeError
+        self.gene_attribute_selection()
+
+        if self.useColumns and self.data:
+            all_vars = list(filter(is_continuous, domain_variables(self.data.domain)))
+            names = np.asarray([var.name for var in all_vars])
         else:
-            names = []
+            var = self.geneVar
+            if var is not None:
+                assert isinstance(var, Orange.data.StringVariable)
+                names, _ = self.data.get_column_view(var)
+
+                if names.dtype == object:
+                    names = [name for name in names if isinstance(name, str)]
+                elif names.dtype.kind in ["U", "S"]:
+                    names = [str(name) for name in names]
+                else:
+                    raise TypeError
+            else:
+                names = []
 
         infodict = {}
-
         if self.geneinfo[1] is not None:
             info = [(name, self.geneinfo[1].get_info(name, None))
                     for name in names]
@@ -629,7 +664,6 @@ class OWSelectGenes(widget.OWWidget):
 
         names = sorted(set(names))
         genes = list(zip(names, map(infodict.get, names)))
-
         symbols = [info.symbol for _, info in genes if info is not None]
 
         model = QStandardItemModel()
@@ -873,11 +907,11 @@ class OWSelectGenes(widget.OWWidget):
 #             report.append("%i instances on input." % len(self.data))
 #         else:
 #             report.append("No data on input.")
-# 
+#
 #         if self.geneVar is not None:
 #             report.append("Gene names taken from %r attribute." %
 #                           escape(self.geneVar.name))
-# 
+#
 #         self.reportSection("Input")
 #         self.startReportList()
 #         for item in report:
@@ -914,6 +948,10 @@ def is_string(var):
     return isinstance(var, Orange.data.StringVariable)
 
 
+def is_continuous(var):
+    return isinstance(var, Orange.data.ContinuousVariable)
+
+
 def domain_variables(domain):
     """
     Return all feature descriptors from the domain.
@@ -944,6 +982,14 @@ def select_by_genes(data, gene_feature, gene_list, preserve_order=True):
 
     return data.from_table(data.domain, data, sel)
 
+
+def select_by_columns(data, gene_list):
+    selection = set(gene_list)
+    metas = data.domain.metas
+    sel = [var for var in data.domain.attributes if str(var.name) in selection]
+    new_domain = Orange.data.Domain(sel, metas=metas)
+
+    return data.from_table(new_domain, data)
 
 _CompletionState = namedtuple(
     "_CompletionState",
