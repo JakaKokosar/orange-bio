@@ -24,7 +24,7 @@ from AnyQt.QtGui import (
 )
 from AnyQt.QtCore import (
     Qt, QRect, QSize, QModelIndex, QStringListModel, QThread, QThreadPool,
-    Slot
+    Slot, QSortFilterProxyModel
 )
 
 import Orange
@@ -89,6 +89,59 @@ class BarItemDelegate(QStyledItemDelegate):
             painter.setBrush(self.brush)
             painter.drawRect(rect)
             painter.restore()
+
+
+class CustomFilterModel(QSortFilterProxyModel):
+
+    def __init__(self, *args, **kwargs):
+        super(CustomFilterModel, self).__init__(*args, **kwargs)
+        self._pattern = ''
+        self._column_index = 0  # defaults to first column
+
+    def setFilterKeyColumn(self, column):
+        self._column_index = column
+
+    def filterAcceptsRow(self, row_index, source_parent):
+        data_model = self.sourceModel()
+
+        is_valid_category = self.validate_category(data_model, row_index)
+        is_valid_filter = self.validate_filters(data_model, row_index)
+
+        if not self._pattern:
+            return is_valid_category and is_valid_filter
+        else:
+            # get column data to perform text filter
+            column_value = data_model.index(row_index, self._column_index).data(role=Qt.DisplayRole)
+            # search pattern
+            is_valid_pattern = self._pattern.lower() in column_value.lower()
+
+            return is_valid_pattern and is_valid_category and is_valid_filter
+
+    def validate_category(self, data_model, row_index):
+        return data_model.index(row_index, 0).data(role=Qt.DisplayRole) in self.categories
+
+    def validate_filters(self, data_model, row_index):
+        fdr = data_model.index(row_index, 5).data(Qt.UserRole)
+        pval = data_model.index(row_index, 4).data(Qt.UserRole)
+        count = data_model.index(row_index, 2).data(Qt.ToolTipRole)
+
+        to_validate = []
+
+        if self.useMinCountFilter:
+            to_validate.append(count >= self.minClusterCount)
+
+        if self.useMaxPValFilter:
+            to_validate.append(pval <= self.maxPValue)
+
+        if self.useMaxFDRFilter:
+            to_validate.append(fdr <= self.maxFDR)
+
+        return all(to_validate)
+
+    def set_filter_values(self, values):
+        if values is not None:
+            for key, value in values.items():
+                setattr(self, key, value)
 
 
 def name_or_none(taxid):
@@ -259,11 +312,9 @@ class OWSetEnrichment(widget.OWWidget):
         fdrfilterbox.layout().setAlignment(cb, Qt.AlignRight)
         fdrfilterbox.layout().setAlignment(sp, Qt.AlignLeft)
 
-        self.filterLineEdit = QLineEdit(
-            self, placeholderText="Filter ...")
+        self.filterLineEdit = QLineEdit(self, placeholderText="Search ...")
 
         self.filterCompleter = QCompleter(self.filterLineEdit)
-        self.filterCompleter.setCaseSensitivity(Qt.CaseInsensitive)
         self.filterLineEdit.setCompleter(self.filterCompleter)
 
         hLayout.addWidget(self.filterLineEdit)
@@ -279,6 +330,18 @@ class OWSetEnrichment(widget.OWWidget):
             rootIsDecorated=False,
             editTriggers=QTreeView.NoEditTriggers,
         )
+
+        self.source_model = QStandardItemModel()
+        self.source_model.setSortRole(Qt.UserRole)
+        self.source_model.setHorizontalHeaderLabels(
+            ["Category", "Term", "Count", "Reference count", "p-value",
+             "FDR", "Enrichment"])
+
+        self.proxy_model = CustomFilterModel(self.annotationsChartView)
+        self.proxy_model.setFilterKeyColumn(1)  # filter only by name (second column).
+
+        self.annotationsChartView.setModel(self.proxy_model)
+
         self.annotationsChartView.viewport().setMouseTracking(True)
         self.mainArea.layout().addWidget(self.annotationsChartView)
 
@@ -302,6 +365,9 @@ class OWSetEnrichment(widget.OWWidget):
             parent=self, threadPool=QThreadPool(self))
         self._executor.submit(task)
 
+    def string_search(self):
+        self.annotationsChartView.model().setFilterFixedString(self.filterLineEdit.text())
+
     def sizeHint(self):
         return QSize(1024, 600)
 
@@ -320,7 +386,6 @@ class OWSetEnrichment(widget.OWWidget):
         taxids = [tid for tid, _ in organisms]
         names = [name for _, name in organisms]
         self.taxid_list = taxids
-
         self.speciesComboBox.clear()
         self.speciesComboBox.addItems(names)
         self.genesets = sets
@@ -356,6 +421,7 @@ class OWSetEnrichment(widget.OWWidget):
         taxid = self.taxid_list[self.speciesIndex]
         self.taxid = "< Do not look >"
         self.setCurrentOrganism(taxid)
+
         if self.__invalidated and self.data is not None:
             self.updateAnnotations()
 
@@ -411,6 +477,7 @@ class OWSetEnrichment(widget.OWWidget):
             self.geneattr = min(self.geneattr, len(self.geneAttrs) - 1)
 
             taxid = data_hints.get_hint(data, "taxid", "")
+
             if taxid in self.taxid_list:
                 self.speciesIndex = self.taxid_list.index(taxid)
                 self.taxid = taxid
@@ -532,6 +599,8 @@ class OWSetEnrichment(widget.OWWidget):
                     not set(categories) <= set(self.currentAnnotatedCategories):
                 self.updateAnnotations()
             else:
+                # compute FDR according the selected categories
+                self.compute_fdr()
                 self.filterAnnotationsChartView()
 
     def updateGeneMatcherSettings(self):
@@ -752,11 +821,8 @@ class OWSetEnrichment(widget.OWWidget):
                 si.setData(value, Qt.UserRole)
             return si
 
-        model = QStandardItemModel()
-        model.setSortRole(Qt.UserRole)
-        model.setHorizontalHeaderLabels(
-            ["Category", "Term", "Count", "Reference count", "p-value",
-             "FDR", "Enrichment"])
+        model = self.source_model
+
         for i, (gset, enrich) in enumerate(results):
             if len(enrich.query_mapped) == 0:
                 continue
@@ -784,7 +850,6 @@ class OWSetEnrichment(widget.OWWidget):
 
             model.appendRow(row)
 
-        self.annotationsChartView.setModel(model)
         self.annotationsChartView.selectionModel().selectionChanged.connect(
             self.commit
         )
@@ -792,6 +857,11 @@ class OWSetEnrichment(widget.OWWidget):
         if not model.rowCount():
             self.warning(0, "No enriched sets found.")
         else:
+            # compute FDR according the selected categories
+            self.compute_fdr()
+            # set source model if there are sets found
+            self.filterAnnotationsChartView()
+            self.proxy_model.setSourceModel(model)
             self.warning(0)
 
         allnames = set(gsname(geneset)
@@ -825,8 +895,6 @@ class OWSetEnrichment(widget.OWWidget):
             self.annotationsChartView.setColumnWidth(i, max(min(sh, 300), 30))
 #             self.annotationsChartView.resizeColumnToContents(i)
 
-        self.filterAnnotationsChartView()
-
         self.progressBarFinished()
         self.setStatusMessage("")
 
@@ -855,61 +923,46 @@ class OWSetEnrichment(widget.OWWidget):
         # TODO: warn on no enriched sets found (i.e no query genes
         # mapped to any set)
 
-    def filterAnnotationsChartView(self, filterString=""):
+    def return_filter_values(self):
+        categories = set(", ".join(category) for category, _ in self.selectedCategories())
+        return {
+            "useMinCountFilter": self.useMinCountFilter,
+            "useMaxPValFilter": self.useMaxPValFilter,
+            "minClusterCount": self.minClusterCount,
+            "useMaxFDRFilter": self.useMaxFDRFilter,
+            "maxPValue": self.maxPValue,
+            "categories": categories,
+            "maxFDR": self.maxFDR
+        }
+
+    def compute_fdr(self):
+        selected_categories = self.return_filter_values().get('categories')
+        data_model = self.source_model
+
+        # get pvalues of rows that match selected category
+        pvals = [(row_index, data_model.index(row_index, 4).data(role=Qt.UserRole))
+                 for row_index in range(data_model.rowCount())
+                 if data_model.index(row_index, 0).data(role=Qt.DisplayRole) in selected_categories]
+
+        fdrs = utils.stats.FDR([pval for _, pval in pvals])
+
+        # set calculated values to the data model
+        for (row_index, pval), fdr in zip(pvals, fdrs):
+            fdr_item = data_model.item(row_index, 5)
+            fdr_item.setData(fmtpdet(fdr), Qt.ToolTipRole)
+            fdr_item.setData(fmtp(fdr), Qt.DisplayRole)
+            fdr_item.setData(fdr, Qt.UserRole)
+
+    def filterAnnotationsChartView(self):
         if self.__state & OWSetEnrichment.RunningEnrichment:
             return
 
-        # TODO: Move filtering to a filter proxy model
-        # TODO: Re-enable string search
-
-        categories = set(", ".join(cat)
-                         for cat, _ in self.selectedCategories())
-
-#         filterString = str(self.filterLineEdit.text()).lower()
-
-        model = self.annotationsChartView.model()
-
-        def ishidden(index):
-            # Is item at index (row) hidden
-            item = model.item(index)
-            item_cat = item.data(Qt.DisplayRole)
-            return item_cat not in categories
-
-        hidemask = [ishidden(i) for i in range(model.rowCount())]
-
-        # compute FDR according the selected categories
-        pvals = [model.item(i, 4).data(Qt.UserRole)
-                 for i, hidden in enumerate(hidemask) if not hidden]
-        fdrs = utils.stats.FDR(pvals)
-
-        # update FDR for the selected collections and apply filtering rules
-        itemsHidden = []
-        fdriter = iter(fdrs)
-        for index, hidden in enumerate(hidemask):
-            if not hidden:
-                fdr = next(fdriter)
-                pval = model.index(index, 4).data(Qt.UserRole)
-                count = model.index(index, 2).data(Qt.ToolTipRole)
-
-                hidden = (self.useMinCountFilter and count < self.minClusterCount) or \
-                         (self.useMaxPValFilter and pval > self.maxPValue) or \
-                         (self.useMaxFDRFilter and fdr > self.maxFDR)
-
-                if not hidden:
-                    fdr_item = model.item(index, 5)
-                    fdr_item.setData(fmtpdet(fdr), Qt.ToolTipRole)
-                    fdr_item.setData(fmtp(fdr), Qt.DisplayRole)
-                    fdr_item.setData(fdr, Qt.UserRole)
-
-            self.annotationsChartView.setRowHidden(
-                index, QModelIndex(), hidden)
-
-            itemsHidden.append(hidden)
-
-        if model.rowCount() and all(itemsHidden):
-            self.information(0, "All sets were filtered out.")
-        else:
-            self.information(0)
+        # set string pattern
+        self.proxy_model._pattern = str(self.filterLineEdit.text())
+        # set filter values to proxy model
+        self.proxy_model.set_filter_values(self.return_filter_values())
+        # filter model
+        self.proxy_model.invalidateFilter()
 
         self._updatesummary()
 
@@ -927,7 +980,7 @@ class OWSetEnrichment(widget.OWWidget):
                 self.__state & OWSetEnrichment.RunningEnrichment:
             return
 
-        model = self.annotationsChartView.model()
+        model = self.source_model
         rows = self.annotationsChartView.selectionModel().selectedRows(0)
         selected = [model.item(index.row(), 0) for index in rows]
         mapped = reduce(operator.ior,
