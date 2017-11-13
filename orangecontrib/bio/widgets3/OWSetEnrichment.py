@@ -29,6 +29,7 @@ from AnyQt.QtCore import (
 
 import Orange
 from Orange.widgets.utils.datacaching import data_hints
+from Orange.widgets.utils.messages import UnboundMsg
 from Orange.widgets import widget, gui, settings
 from Orange.widgets.utils.concurrent import ThreadExecutor, Task, methodinvoke
 
@@ -45,6 +46,8 @@ fmtpdet = lambda score: "%0.9f" % score if score > 10e-4 else "%0.5e" % score
 
 # A translation table mapping punctuation, ... to spaces
 _TR_TABLE = dict((ord(c), ord(" ")) for c in ".,!?()[]{}:;'\"<>")
+
+Msg = UnboundMsg
 
 
 def word_split(string):
@@ -134,7 +137,8 @@ class CustomFilterModel(QSortFilterProxyModel):
             to_validate.append(pval <= self.maxPValue)
 
         if self.useMaxFDRFilter:
-            to_validate.append(fdr <= self.maxFDR)
+            if fdr is not None:
+                to_validate.append(fdr <= self.maxFDR)
 
         return all(to_validate)
 
@@ -211,6 +215,14 @@ class OWSetEnrichment(widget.OWWidget):
     autocommit = settings.Setting(False)
 
     Ready, Initializing, Loading, RunningEnrichment = 0, 1, 2, 4
+
+    class Error(widget.OWWidget.Error):
+        no_gene_names = Msg("Input data contains no columns with gene names")
+        no_data_onInput = Msg("No data on input")
+
+    class Warning(widget.OWWidget.Warning):
+        no_sets_found = Msg("No enriched sets found")
+
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -421,7 +433,7 @@ class OWSetEnrichment(widget.OWWidget):
         taxid = self.taxid_list[self.speciesIndex]
         self.taxid = "< Do not look >"
         self.setCurrentOrganism(taxid)
-
+        
         if self.__invalidated and self.data is not None:
             self.updateAnnotations()
 
@@ -458,7 +470,7 @@ class OWSetEnrichment(widget.OWWidget):
         if self.__state & OWSetEnrichment.Initializing:
             self.__initialize_finish()
 
-        self.error(0)
+        self.Error.clear()
         self.closeContext()
         self.clear()
 
@@ -654,12 +666,11 @@ class OWSetEnrichment(widget.OWWidget):
         self._cancelPending()
         self._clearView()
 
-        self.information(0)
-        self.warning(0)
-        self.error(0)
+        self.Warning.clear()
+        self.Error.clear()
 
         if not self.genesinrows and len(self.geneAttrs) == 0:
-            self.error(0, "Input data contains no columns with gene names")
+            self.Error.no_gene_names()
             return
 
         self.__state = OWSetEnrichment.RunningEnrichment
@@ -855,14 +866,16 @@ class OWSetEnrichment(widget.OWWidget):
         )
 
         if not model.rowCount():
-            self.warning(0, "No enriched sets found.")
+            self.Warning.no_sets_found()
         else:
             # compute FDR according the selected categories
             self.compute_fdr()
             # set source model if there are sets found
             self.filterAnnotationsChartView()
             self.proxy_model.setSourceModel(model)
-            self.warning(0)
+            self.Warning.clear()
+
+        self._updatesummary()
 
         allnames = set(gsname(geneset)
                        for geneset, (count, _, _, _) in results if count)
@@ -901,8 +914,8 @@ class OWSetEnrichment(widget.OWWidget):
     def _updatesummary(self):
         state = self.state
         if state is None:
-            self.error(0,)
-            self.warning(0)
+            self.Error.no_data_onInput()
+            self.Warning.clear()
             self.infoBox.setText("No data on input.\n")
             return
 
