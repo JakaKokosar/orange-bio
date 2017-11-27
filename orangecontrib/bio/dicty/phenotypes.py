@@ -6,8 +6,10 @@ except ImportError:
 import shutil
 import pickle
 
-from collections import defaultdict
+# Python 2 and 3:
+from functools import reduce
 
+from collections import defaultdict
 from ..utils import serverfiles
 
 domain = "dictybase"
