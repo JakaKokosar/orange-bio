@@ -1,19 +1,10 @@
-from __future__ import absolute_import, division
-
 import os
 import sys
 import warnings
+import pickle
 
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
 
-try:
-    from Orange.utils import environ
-except ImportError:
-    from orangecontrib.bio.utils import environ
-
+from orangecontrib.bio.utils import environ
 from orangecontrib.bio.utils import serverfiles
 
 _COMMON_NAMES = (

@@ -1,12 +1,11 @@
 import os
-try:
-    from urllib2 import urlopen
-except ImportError:
-    from urllib.request import urlopen
 import shutil
 import pickle
 
+
+from urllib.request import urlopen
 from collections import defaultdict
+from functools import reduce
 
 from ..utils import serverfiles
 

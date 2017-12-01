@@ -1,8 +1,6 @@
 """
 
 """
-from __future__ import absolute_import
-
 REST_API = "http://rest.kegg.jp/"
 
 

@@ -1,38 +1,41 @@
-"""<name>Set Enrichment</name>
-<icon>icons/GeneSetEnrichment.svg</icon>
 """
+Set Enrichment
+--------------
 
-from __future__ import absolute_import, with_statement
-
-import threading
+"""
+import sys
 import math
 import operator
+import itertools
+import traceback
+import types
+import concurrent.futures
 from collections import defaultdict
+from functools import reduce, partial
 
-from Orange.orng import orngEnviron
-from orangecontrib.bio.utils import serverfiles
-from Orange.orng.orngDataCaching import data_hints
-from Orange.OrangeWidgets import OWGUI
-from Orange.OrangeWidgets.OWGUI import LinkStyledItemDelegate, LinkRole
-from Orange.OrangeWidgets.OWGUI import BarItemDelegate
-from Orange.OrangeWidgets.OWWidget import *
-from Orange.OrangeWidgets.OWConcurrent import ThreadExecutor, Task
-from Orange.utils import ConsoleProgressBar
+import numpy as np
 
-from .utils.download import EnsureDownloaded
+from AnyQt.QtWidgets import (
+    QTreeWidget, QTreeWidgetItem, QTreeView, QLineEdit, QCompleter,
+    QHBoxLayout, QStyle, QStyledItemDelegate, QApplication
+)
+from AnyQt.QtGui import (
+    QBrush, QColor, QFont, QStandardItemModel, QStandardItem
+)
+from AnyQt.QtCore import (
+    Qt, QRect, QSize, QModelIndex, QStringListModel, QThread, QThreadPool,
+    Slot, QSortFilterProxyModel
+)
 
-from .. import obiGene, obiGeneSets, obiProb, obiTaxonomy
+import Orange
+from Orange.widgets.utils.datacaching import data_hints
+from Orange.widgets.utils.messages import UnboundMsg
+from Orange.widgets import widget, gui, settings
+from Orange.widgets.utils.concurrent import ThreadExecutor, Task, methodinvoke
 
-NAME = "Set Enrichment"
-DESCRIPTION = ""
-ICON = "icons/GeneSetEnrichment.svg"
-PRIORITY = 5000
+from orangecontrib.bio import gene, geneset, taxonomy, utils
 
-INPUTS = [("Data", Orange.data.Table, "setData", Default),
-          ("Reference", Orange.data.Table, "setReference")]
-OUTPUTS = [("Data subset", Orange.data.Table)]
-
-REPLACES = ["_bioinformatics.widgets.OWSetEnrichment.OWSetEnrichment"]
+from orangecontrib.bio.widgets.utils.download import EnsureDownloaded
 
 
 def gsname(geneset):
@@ -41,292 +44,493 @@ def gsname(geneset):
 fmtp = lambda score: "%0.5f" % score if score > 10e-4 else "%0.1e" % score
 fmtpdet = lambda score: "%0.9f" % score if score > 10e-4 else "%0.5e" % score
 
-
-def as_unicode(string):
-    if isinstance(string, str):
-        return string.decode("utf-8", errors="ignore")
-    else:
-        return string
-
 # A translation table mapping punctuation, ... to spaces
 _TR_TABLE = dict((ord(c), ord(" ")) for c in ".,!?()[]{}:;'\"<>")
+
+Msg = UnboundMsg
+
 
 def word_split(string):
     """
     Split a string into a list of words.
     """
-    return as_unicode(string).translate(_TR_TABLE).split()
+    return string.translate(_TR_TABLE).split()
 
 
-def _toPyObject(variant):
-    val = variant.toPyObject()
-    if isinstance(val, type(NotImplemented)): # PyQt 4.4 converts python int, floats ... to C types
-        qtype = variant.type()
-        if qtype == QVariant.Double:
-            val, ok = variant.toDouble()
-        elif qtype == QVariant.Int:
-            val, ok = variant.toInt()
-        elif qtype == QVariant.LongLong:
-            val, ok = variant.toLongLong()
-        elif qtype == QVariant.String:
-            val = variant.toString()
-    return val
+class BarItemDelegate(QStyledItemDelegate):
+    def __init__(self, parent, brush=QBrush(QColor(255, 170, 127)),
+                 scale=(0.0, 1.0)):
+        super().__init__(parent)
+        self.brush = brush
+        self.scale = scale
 
-class MyTreeWidget(QTreeWidget):
-    def paintEvent(self, event):
-        QTreeWidget.paintEvent(self, event)
-        if getattr(self, "_userMessage", None):
-            painter = QPainter(self.viewport())
-            font = QFont(self.font())
-            font.setPointSize(15)
-            painter.setFont(font)
-            painter.drawText(self.viewport().geometry(), Qt.AlignCenter, self._userMessage)
-            painter.end()
-
-class MyTreeWidgetItem(QTreeWidgetItem):
-    def __lt__(self, other):
-        if not self.treeWidget():
-            return id(self) < id(other)
-        column = self.treeWidget().sortColumn()
-        if column in [4,5]:
-            lhs = _toPyObject(self.data(column, 42))
-            rhs = _toPyObject(other.data(column, 42))
+    def paint(self, painter, option, index):
+        if option.widget is not None:
+            style = option.widget.style()
         else:
-            lhs = _toPyObject(self.data(column, Qt.DisplayRole))
-            rhs = _toPyObject(other.data(column, Qt.DisplayRole))
-        return lhs < rhs
+            style = QApplication.instance().style()
 
-def name_or_none(id):
+        style.drawPrimitive(
+            QStyle.PE_PanelItemViewRow, option, painter, option.widget)
+        style.drawPrimitive(
+            QStyle.PE_PanelItemViewItem, option, painter, option.widget)
+        rect = option.rect
+        val = index.data(Qt.DisplayRole)
+
+        if isinstance(val, float):
+            if np.isfinite(val):
+                minv, maxv = self.scale
+                val = (val - minv) / (maxv - minv)
+                rect = rect.adjusted(
+                    1, 1, - int(rect.width() * (1.0 - val)) - 2, -2)
+            else:
+                rect = QRect()
+
+            painter.save()
+            if option.state & QStyle.State_Selected:
+                painter.setOpacity(0.75)
+            painter.setBrush(self.brush)
+            painter.drawRect(rect)
+            painter.restore()
+
+
+class CustomFilterModel(QSortFilterProxyModel):
+
+    def __init__(self, *args, **kwargs):
+        super(CustomFilterModel, self).__init__(*args, **kwargs)
+        self._pattern = ''
+        self._column_index = 0  # defaults to first column
+
+    def setFilterKeyColumn(self, column):
+        self._column_index = column
+
+    def filterAcceptsRow(self, row_index, source_parent):
+        data_model = self.sourceModel()
+
+        is_valid_category = self.validate_category(data_model, row_index)
+        is_valid_filter = self.validate_filters(data_model, row_index)
+
+        if not self._pattern:
+            return is_valid_category and is_valid_filter
+        else:
+            # get column data to perform text filter
+            column_value = data_model.index(row_index, self._column_index).data(role=Qt.DisplayRole)
+            # search pattern
+            is_valid_pattern = self._pattern.lower() in column_value.lower()
+
+            return is_valid_pattern and is_valid_category and is_valid_filter
+
+    def validate_category(self, data_model, row_index):
+        return data_model.index(row_index, 0).data(role=Qt.DisplayRole) in self.categories
+
+    def validate_filters(self, data_model, row_index):
+        fdr = data_model.index(row_index, 5).data(Qt.UserRole)
+        pval = data_model.index(row_index, 4).data(Qt.UserRole)
+        count = data_model.index(row_index, 2).data(Qt.ToolTipRole)
+
+        to_validate = []
+
+        if self.useMinCountFilter:
+            to_validate.append(count >= self.minClusterCount)
+
+        if self.useMaxPValFilter:
+            to_validate.append(pval <= self.maxPValue)
+
+        if self.useMaxFDRFilter:
+            if fdr is not None:
+                to_validate.append(fdr <= self.maxFDR)
+
+        return all(to_validate)
+
+    def set_filter_values(self, values):
+        if values is not None:
+            for key, value in values.items():
+                setattr(self, key, value)
+
+
+def name_or_none(taxid):
     """Return organism name for ncbi taxid or None if not found.
     """
     try:
-        return obiTaxonomy.name(id)
-    except obiTaxonomy.UnknownSpeciesIdentifier:
+        return taxonomy.name(taxid)
+    except taxonomy.UnknownSpeciesIdentifier:
         return None
 
-class OWSetEnrichment(OWWidget):
-    settingsList = ["speciesIndex", "genesinrows", "geneattr",
-                    "categoriesCheckState", "useMinCountFilter",
-                    "useMaxPValFilter", "useMaxFDRFilter", "minClusterCount",
-                    "maxPValue", "maxFDR", "autocommit"]
-    contextHandlers = {"":DomainContextHandler("", ["speciesIndex", "genesinrows", "geneattr", "categoriesCheckState"])}
 
-    def refreshHierarchy(self):
-        self.setHierarchy(*self.getHierarchy(taxid=self.taxid_list[self.speciesIndex]))
+def fulfill(value):
+    """Return a pre-fulfilled Future yielding `value`."""
+    f = concurrent.futures.Future()
+    f.set_result(value)
+    return f
 
-    def __init__(self, parent=None, signalManager=None, name="Set Enrichment", **kwargs):
-        OWWidget.__init__(self, parent, signalManager, name, **kwargs)
-        self.inputs = [("Data", ExampleTable, self.setData, Default), ("Reference", ExampleTable, self.setReference)]
-        self.outputs = [("Data subset", ExampleTable)]
 
-        self.speciesIndex = 0
-        self.genesinrows = False
-        self.geneattr = 0
+def withtraceback(func):
+    def f(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as ex:
+            ex._traceback = traceback.format_exc()
+            raise
+    return f
+
+
+def memoize(func):
+    cache = {}
+
+    def memoized(arg):
+        try:
+            return cache[arg]
+        except KeyError:
+            cache[arg] = value = func(arg)
+            return value
+
+    return memoized
+
+
+class OWSetEnrichment(widget.OWWidget):
+    name = "Set Enrichment"
+    description = ""
+    icon = "../widgets/icons/GeneSetEnrichment.svg"
+    priority = 5000
+
+    inputs = [("Data", Orange.data.Table, "setData", widget.Default),
+              ("Reference", Orange.data.Table, "setReference")]
+    outputs = [("Data subset", Orange.data.Table)]
+
+    settingsHandler = settings.DomainContextHandler()
+
+    taxid = settings.ContextSetting(None)
+    speciesIndex = settings.ContextSetting(0)
+    genesinrows = settings.ContextSetting(False)
+    geneattr = settings.ContextSetting(0)
+    categoriesCheckState = settings.ContextSetting({})
+
+    useReferenceData = settings.Setting(False)
+    useMinCountFilter = settings.Setting(True)
+    useMaxPValFilter = settings.Setting(True)
+    useMaxFDRFilter = settings.Setting(True)
+    minClusterCount = settings.Setting(3)
+    maxPValue = settings.Setting(0.01)
+    maxFDR = settings.Setting(0.01)
+    autocommit = settings.Setting(False)
+
+    Ready, Initializing, Loading, RunningEnrichment = 0, 1, 2, 4
+
+    class Error(widget.OWWidget.Error):
+        no_gene_names = Msg("Input data contains no columns with gene names")
+        no_data_onInput = Msg("No data on input")
+
+    class Warning(widget.OWWidget.Warning):
+        no_sets_found = Msg("No enriched sets found")
+
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
         self.geneMatcherSettings = [False, False, True, False]
-        self.useReferenceData = False
-        self.useMinCountFilter = True
-        self.useMaxPValFilter = True
-        self.useMaxFDRFilter = True
-        self.minClusterCount = 3
-        self.maxPValue = 0.01
-        self.maxFDR = 0.01
-        self.autocommit = False
-        self.categoriesCheckState = {}
 
-        self.loadSettings()
-        self._changed = False
+        self.data = None
+        self.referenceData = None
+        self.taxid_list = []
 
-        box = OWGUI.widgetBox(self.controlArea, "Info")
-        self.infoBox = OWGUI.widgetLabel(box, "Info")
-        self.infoBox.setText("No data on input")
+        self.__genematcher = (None, fulfill(gene.matcher([])))
+        self.__invalidated = False
 
-        self.speciesComboBox = OWGUI.comboBox(self.controlArea, self,
-                      "speciesIndex", "Species",
-                      callback=lambda: (self.refreshHierarchy(), self.data and self.updateAnnotations()),
-                      debuggingEnabled=0)
+        self.currentAnnotatedCategories = []
+        self.state = None
+        self.__state = OWSetEnrichment.Initializing
 
-        box = OWGUI.widgetBox(self.controlArea, "Entity names")
-        self.geneAttrComboBox = OWGUI.comboBox(box, self, "geneattr",
-                                "Entity feature",
-                                sendSelectedValue=0,
-                                callback=self.updateAnnotations)
+        box = gui.widgetBox(self.controlArea, "Info")
+        self.infoBox = gui.widgetLabel(box, "Info")
+        self.infoBox.setText("No data on input.\n")
 
-        cb = OWGUI.checkBox(box, self, "genesinrows", "Use feature names",
-                            callback=lambda :self.data and self.updateAnnotations(),
-                            disables=[(-1, self.geneAttrComboBox)])
+        self.speciesComboBox = gui.comboBox(
+            self.controlArea, self,
+            "speciesIndex", "Species",
+            callback=self.__on_speciesIndexChanged)
+
+        box = gui.widgetBox(self.controlArea, "Entity names")
+        self.geneAttrComboBox = gui.comboBox(
+            box, self, "geneattr", "Entity feature", sendSelectedValue=0,
+            callback=self.updateAnnotations)
+
+        cb = gui.checkBox(
+            box, self, "genesinrows", "Use feature names",
+            callback=self.updateAnnotations,
+            disables=[(-1, self.geneAttrComboBox)])
         cb.makeConsistent()
 
-        OWGUI.button(box, self, "Gene matcher settings",
-                     callback=self.updateGeneMatcherSettings,
-                     tooltip="Open gene matching settings dialog",
-                     debuggingEnabled=0)
+#         gui.button(box, self, "Gene matcher settings",
+#                    callback=self.updateGeneMatcherSettings,
+#                    tooltip="Open gene matching settings dialog")
 
-        self.referenceRadioBox = OWGUI.radioButtonsInBox(self.controlArea,
-                    self, "useReferenceData", ["All entities", "Reference set (input)"],
-                    tooltips=["Use entire genome (for gene set enrichment) or all available entities for reference",
-                              "Use entities from Reference Examples input signal as reference"],
-                    box="Reference", callback=self.updateAnnotations)
+        self.referenceRadioBox = gui.radioButtonsInBox(
+            self.controlArea,
+            self, "useReferenceData",
+            ["All entities", "Reference set (input)"],
+            tooltips=["Use entire genome (for gene set enrichment) or all " +
+                      "available entities for reference",
+                      "Use entities from Reference Examples input signal " +
+                      "as reference"],
+            box="Reference", callback=self.updateAnnotations)
 
-        box = OWGUI.widgetBox(self.controlArea, "Entity Sets")
+        box = gui.widgetBox(self.controlArea, "Entity Sets")
         self.groupsWidget = QTreeWidget(self)
         self.groupsWidget.setHeaderLabels(["Category"])
         box.layout().addWidget(self.groupsWidget)
 
         hLayout = QHBoxLayout()
         hLayout.setSpacing(10)
-        hWidget = OWGUI.widgetBox(self.mainArea, orientation=hLayout)
-        sb, sbcb = OWGUI.spin(hWidget, self, "minClusterCount",
-                              0, 100, label="Entities",
-                              tooltip="Minimum entity count",
-                              callback=self.filterAnnotationsChartView,
-                              callbackOnReturn=True,
-                              checked="useMinCountFilter",
-                              checkCallback=self.filterAnnotationsChartView)
+        hWidget = gui.widgetBox(self.mainArea, orientation=hLayout)
+        gui.spin(hWidget, self, "minClusterCount",
+                 0, 100, label="Entities",
+                 tooltip="Minimum entity count",
+                 callback=self.filterAnnotationsChartView,
+                 callbackOnReturn=True,
+                 checked="useMinCountFilter",
+                 checkCallback=self.filterAnnotationsChartView)
 
-        dsp, dspcb = OWGUI.doubleSpin(hWidget, self,
-                        "maxPValue", 0.0, 1.0, 0.0001,
-                        label="p-value",
-                        tooltip="Maximum p-value",
-                        callback=self.filterAnnotationsChartView,
-                        callbackOnReturn=True,
-                        checked="useMaxPValFilter",
-                        checkCallback=self.filterAnnotationsChartView)
+        pvalfilterbox = gui.widgetBox(hWidget, orientation="horizontal")
+        cb = gui.checkBox(
+            pvalfilterbox, self, "useMaxPValFilter", "p-value",
+            callback=self.filterAnnotationsChartView)
 
-        dsfdr, dsfdrcb = OWGUI.doubleSpin(hWidget, self,
-                        "maxFDR", 0.0, 1.0, 0.0001,
-                        label="FDR",
-                        tooltip="Maximum False discovery rate",
-                        callback=self.filterAnnotationsChartView,
-                        callbackOnReturn=True,
-                        checked="useMaxFDRFilter",
-                        checkCallback=self.filterAnnotationsChartView)
+        sp = gui.doubleSpin(
+            pvalfilterbox, self, "maxPValue", 0.0, 1.0, 0.0001,
+            tooltip="Maximum p-value",
+            callback=self.filterAnnotationsChartView,
+            callbackOnReturn=True,
+        )
+        sp.setEnabled(self.useMaxFDRFilter)
+        cb.toggled[bool].connect(sp.setEnabled)
 
-        from Orange.OrangeWidgets import OWGUIEx
-        self.filterLineEdit = OWGUIEx.QLineEditWithActions(self)
-        self.filterLineEdit.setPlaceholderText("Filter ...")
-        action = QAction(QIcon(os.path.join(orngEnviron.canvasDir,
-                        "icons", "delete_gray.png")), "Clear", self)
+        pvalfilterbox.layout().setAlignment(cb, Qt.AlignRight)
+        pvalfilterbox.layout().setAlignment(sp, Qt.AlignLeft)
 
-        self.filterLineEdit.addAction(action, 0, Qt.AlignHCenter)
-        self.connect(action, SIGNAL("triggered()"), self.filterLineEdit.clear)
+        fdrfilterbox = gui.widgetBox(hWidget, orientation="horizontal")
+        cb = gui.checkBox(
+            fdrfilterbox, self, "useMaxFDRFilter", "FDR",
+            callback=self.filterAnnotationsChartView)
+
+        sp = gui.doubleSpin(
+            fdrfilterbox, self, "maxFDR", 0.0, 1.0, 0.0001,
+            tooltip="Maximum False discovery rate",
+            callback=self.filterAnnotationsChartView,
+            callbackOnReturn=True,
+        )
+        sp.setEnabled(self.useMaxFDRFilter)
+        cb.toggled[bool].connect(sp.setEnabled)
+
+        fdrfilterbox.layout().setAlignment(cb, Qt.AlignRight)
+        fdrfilterbox.layout().setAlignment(sp, Qt.AlignLeft)
+
+        self.filterLineEdit = QLineEdit(self, placeholderText="Search ...")
 
         self.filterCompleter = QCompleter(self.filterLineEdit)
-        self.filterCompleter.setCaseSensitivity(Qt.CaseInsensitive)
         self.filterLineEdit.setCompleter(self.filterCompleter)
 
         hLayout.addWidget(self.filterLineEdit)
         self.mainArea.layout().addWidget(hWidget)
 
-        self.connect(self.filterLineEdit, SIGNAL("textChanged(QString)"),
-                     self.filterAnnotationsChartView)
+        self.filterLineEdit.textChanged.connect(
+            self.filterAnnotationsChartView)
 
-        self.annotationsChartView = MyTreeWidget(self)
-        self.annotationsChartView.setHeaderLabels(["Category", "Term",
-                            "Count", "Reference count", "p-value", "FDR", "Enrichment"])
-        self.annotationsChartView.setAlternatingRowColors(True)
-        self.annotationsChartView.setSortingEnabled(True)
-        self.annotationsChartView.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.annotationsChartView.setRootIsDecorated(False)
+        self.annotationsChartView = QTreeView(
+            alternatingRowColors=True,
+            sortingEnabled=True,
+            selectionMode=QTreeView.ExtendedSelection,
+            rootIsDecorated=False,
+            editTriggers=QTreeView.NoEditTriggers,
+        )
+
+        self.source_model = QStandardItemModel()
+        self.source_model.setSortRole(Qt.UserRole)
+        self.source_model.setHorizontalHeaderLabels(
+            ["Category", "Term", "Count", "Reference count", "p-value",
+             "FDR", "Enrichment"])
+
+        self.proxy_model = CustomFilterModel(self.annotationsChartView)
+        self.proxy_model.setFilterKeyColumn(1)  # filter only by name (second column).
+
+        self.annotationsChartView.setModel(self.proxy_model)
+
         self.annotationsChartView.viewport().setMouseTracking(True)
-        self.annotationsChartView.itemSelectionChanged.connect(self.invalidate)
         self.mainArea.layout().addWidget(self.annotationsChartView)
 
-        contextEventFilter = OWGUI.VisibleHeaderSectionContextEventFilter(self.annotationsChartView)
+        contextEventFilter = gui.VisibleHeaderSectionContextEventFilter(
+            self.annotationsChartView)
         self.annotationsChartView.header().installEventFilter(contextEventFilter)
 
-        self.taxid_list = []
-
-        self.connect(self.groupsWidget, SIGNAL("itemClicked(QTreeWidgetItem *, int)"), self.subsetSelectionChanged)
-
-        box = OWGUI.widgetBox(self.controlArea, "Commit")
-        cb = OWGUI.checkBox(box, self, "autocommit", "Commit on any change")
-        b = OWGUI.button(box, self, "Commit", callback=self.commit,
-                         default=True)
-        OWGUI.setStopper(self, b, cb, "_changed", callback=self.commit)
-        self.loadedGenematcher = "None"
-        self.referenceData = None
-        self.data = None
-
-        self.treeItems = []
-
-        self.resize(1024, 600)
-
-        self.connect(self, SIGNAL("widgetStateChanged(QString, int, QString)"), self.onStateChange)
-
-        self.updatingAnnotationsFlag = False
-        self.currentAnnotatedCategories = []
+        self.groupsWidget.itemClicked.connect(self.subsetSelectionChanged)
+        gui.auto_commit(self.controlArea, self, "autocommit", "Commit")
 
         self.setBlocking(True)
 
         task = EnsureDownloaded(
-            [(obiTaxonomy.Taxonomy.DOMAIN, obiTaxonomy.Taxonomy.FILENAME),
-             (obiGeneSets.sfdomain, "index.pck")]
+            [(taxonomy.Taxonomy.DOMAIN, taxonomy.Taxonomy.FILENAME),
+             (geneset.sfdomain, "index.pck")]
         )
 
-        def a1():
-            oldi = self.speciesIndex
-            self.updateHierarchy()
-            self.speciesIndex = max(min(oldi, len(self.taxid_list)-1),0)
-
-        task.finished.connect(a1)
-
-        self._executor = ThreadExecutor()
+        task.finished.connect(self.__initialize_finish)
+        self.setStatusMessage("Initializing")
+        self._executor = ThreadExecutor(
+            parent=self, threadPool=QThreadPool(self))
         self._executor.submit(task)
 
-    def no_gene_matching(self):
-        #only direct gene matching
-        return True if len(self.genematcher.matchers) == 1 else False
+    def string_search(self):
+        self.annotationsChartView.model().setFilterFixedString(self.filterLineEdit.text())
 
-    def updateHierarchy(self):
-        try:
-            all, local = obiGeneSets.list_all(), obiGeneSets.list_local()
-            organisms = set(obiTaxonomy.essential_taxids() + filter(None, [t[1] for t in all]))
+    def sizeHint(self):
+        return QSize(1024, 600)
 
-            organism_names = map(name_or_none, organisms)
-            organisms = [-1] +  [taxid for taxid, name in zip(organisms, organism_names) \
-                         if name is not None]
-            self.speciesComboBox.clear()
-            self.taxid_list = list(organisms)
-            self.speciesComboBox.addItems(["None" if id < 0 else obiTaxonomy.name(id) for id in self.taxid_list])
-            self.genesets = all
-        finally:
-            self.setBlocking(False)
+    def __initialize_finish(self):
+        # Finalize the the widget's initialization (preferably after
+        # ensuring all required databases have been downloaded.
+
+        sets = geneset.list_all()
+        taxids = set(taxonomy.common_taxids() +
+                     list(filter(None, [tid for _, tid, _ in sets])))
+        organisms = [(tid, name_or_none(tid)) for tid in taxids]
+        organisms = [(tid, name) for tid, name in organisms
+                     if name is not None]
+
+        organisms = [(None, "None")] + sorted(organisms)
+        taxids = [tid for tid, _ in organisms]
+        names = [name for _, name in organisms]
+        self.taxid_list = taxids
+        self.speciesComboBox.clear()
+        self.speciesComboBox.addItems(names)
+        self.genesets = sets
+
+        if self.taxid in self.taxid_list:
+            taxid = self.taxid
+        else:
+            taxid = self.taxid_list[0]
+
+        self.taxid = None
+        self.setCurrentOrganism(taxid)
+        self.setBlocking(False)
+        self.__state = OWSetEnrichment.Ready
+        self.setStatusMessage("")
+
+    def setCurrentOrganism(self, taxid):
+        """Set the current organism `taxid`."""
+        if taxid not in self.taxid_list:
+            taxid = self.taxid_list[min(self.speciesIndex,
+                                        len(self.taxid_list) - 1)]
+        if self.taxid != taxid:
+            self.taxid = taxid
+            self.speciesIndex = self.taxid_list.index(taxid)
+            self.refreshHierarchy()
+            self._invalidateGeneMatcher()
+            self._invalidate()
+
+    def currentOrganism(self):
+        """Return the current organism taxid"""
+        return self.taxid
+
+    def __on_speciesIndexChanged(self):
+        taxid = self.taxid_list[self.speciesIndex]
+        self.taxid = "< Do not look >"
+        self.setCurrentOrganism(taxid)
+        
+        if self.__invalidated and self.data is not None:
+            self.updateAnnotations()
+
+    def clear(self):
+        """Clear/reset the widget state."""
+        self._cancelPending()
+        self.state = None
+
+        self.__state = self.__state & ~OWSetEnrichment.RunningEnrichment
+
+        self._clearView()
+
+        if self.annotationsChartView.model() is not None:
+            self.annotationsChartView.model().clear()
+
+        self.geneAttrComboBox.clear()
+        self.geneAttrs = []
+        self._updatesummary()
+
+    def _cancelPending(self):
+        """Cancel pending tasks."""
+        if self.state is not None:
+            self.state.results.cancel()
+            self.state.namematcher.cancel()
+            self.state.cancelled = True
+
+    def _clearView(self):
+        """Clear the enrichment report view (main area)."""
+        if self.annotationsChartView.model() is not None:
+            self.annotationsChartView.model().clear()
 
     def setData(self, data=None):
-        self.data = data
-        self.error(0)
-        self.closeContext("")
-        self.geneAttrComboBox.clear()
+        """Set the input dataset with query gene names"""
+        if self.__state & OWSetEnrichment.Initializing:
+            self.__initialize_finish()
+
+        self.Error.clear()
+        self.closeContext()
+        self.clear()
+
         self.groupsWidget.clear()
-        self.annotationsChartView.clear()
+        self.data = data
 
-        if not getattr(self,"taxid_list", None):
-            QTimer.singleShot(100, lambda data=data: self.setData(data))
-            return
-        if data:
-            self.geneAttrs = [attr for attr in data.domain.variables + data.domain.getmetas().values() \
-                              if attr.varType != orange.VarTypes.Continuous]
+        if data is not None:
+            varlist = [var for var in data.domain.variables + data.domain.metas
+                       if isinstance(var, Orange.data.StringVariable)]
 
-            self.geneAttrComboBox.addItems([attr.name for attr in self.geneAttrs])
+            self.geneAttrs = varlist
+            for var in varlist:
+                self.geneAttrComboBox.addItem(*gui.attributeItem(var))
+
+            oldtaxid = self.taxid
             self.geneattr = min(self.geneattr, len(self.geneAttrs) - 1)
 
             taxid = data_hints.get_hint(data, "taxid", "")
-            try:
+
+            if taxid in self.taxid_list:
                 self.speciesIndex = self.taxid_list.index(taxid)
-            except ValueError, ex:
-                pass
-            self.genesinrows = data_hints.get_hint(data, "genesinrows", self.genesinrows)
+                self.taxid = taxid
 
-            self.openContext("", data)
-        
+            self.genesinrows = data_hints.get_hint(
+                data, "genesinrows", self.genesinrows)
+
+            self.openContext(data)
+            if oldtaxid != self.taxid:
+                self.taxid = "< Do not look >"
+                self.setCurrentOrganism(taxid)
+
             self.refreshHierarchy()
-
-            self.loadedGenematcher = "None"
-            self.updateAnnotations()
+            self._invalidate()
 
     def setReference(self, data=None):
+        """Set the (optional) input dataset with reference gene names."""
         self.referenceData = data
         self.referenceRadioBox.setEnabled(bool(data))
+        if self.useReferenceData:
+            self._invalidate()
+
+    def handleNewSignals(self):
+        if self.__invalidated:
+            self.updateAnnotations()
+
+    def _invalidateGeneMatcher(self):
+        _, f = self.__genematcher
+        f.cancel()
+        self.__genematcher = (None, fulfill(gene.matcher([])))
+
+    def _invalidate(self):
+        self.__invalidated = True
+
+    def genesFromTable(self, table):
+        if self.genesinrows:
+            genes = [attr.name for attr in table.domain.attributes]
+        else:
+            geneattr = self.geneAttrs[self.geneattr]
+            genes = [str(ex[geneattr]) for ex in table]
+        return genes
 
     def getHierarchy(self, taxid):
         def recursive_dict():
@@ -344,15 +548,19 @@ class OWSetEnrichment(OWWidget):
 
     def setHierarchy(self, hierarchy, hierarchy_noorg):
         self.groupsWidgetItems = {}
+
         def fill(col, parent, full=(), org=""):
             for key, value in sorted(col.items()):
                 full_cat = full + (key,)
                 item = QTreeWidgetItem(parent, [key])
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable |
+                              Qt.ItemIsSelectable | Qt.ItemIsEnabled)
                 if value:
                     item.setFlags(item.flags() | Qt.ItemIsTristate)
 
-                item.setData(0, Qt.CheckStateRole, QVariant(self.categoriesCheckState.get((full_cat, org), Qt.Checked)))
+                checked = self.categoriesCheckState.get(
+                    (full_cat, org), Qt.Checked)
+                item.setData(0, Qt.CheckStateRole, checked)
                 item.setExpanded(True)
                 item.category = full_cat
                 item.organism = org
@@ -363,412 +571,509 @@ class OWSetEnrichment(OWWidget):
         fill(hierarchy[1], self.groupsWidget, org=hierarchy[0])
         fill(hierarchy_noorg[1], self.groupsWidget, org=hierarchy_noorg[0])
 
-#    def updateCategoryCounts(self):
-#        for cat, item in self.groupWidgetItem:
-#            item.setData(1, QVariant(), Qt.DisplayRole)
+    def refreshHierarchy(self):
+        self.setHierarchy(*self.getHierarchy(taxid=self.taxid_list[self.speciesIndex]))
 
     def selectedCategories(self):
-        return [(key, org) for (key, org), check in self.getHierarchyCheckState().items() if check == Qt.Checked]
+        """
+        Return a list of currently selected hierarchy keys.
+
+        A key is a tuple of identifiers from the root to the leaf of
+        the hierarchy tree.
+        """
+        return [key for key, check in self.getHierarchyCheckState().items()
+                if check == Qt.Checked]
 
     def getHierarchyCheckState(self):
         def collect(item, full=()):
             checked = item.checkState(0)
-            name = str(item.data(0, Qt.DisplayRole).toString())
+            name = str(item.data(0, Qt.DisplayRole))
             full_cat = full + (name,)
             result = [((full_cat, item.organism), checked)]
             for i in range(item.childCount()):
                 result.extend(collect(item.child(i), full_cat))
             return result
 
-        items = [self.groupsWidget.topLevelItem(i) for i in range(self.groupsWidget.topLevelItemCount())]
-        states = reduce(list.__add__, [collect(item) for item in items], [])
+        items = [self.groupsWidget.topLevelItem(i)
+                 for i in range(self.groupsWidget.topLevelItemCount())]
+        states = itertools.chain(*(collect(item) for item in items))
         return dict(states)
 
     def subsetSelectionChanged(self, item, column):
+        # The selected geneset (hierarchy) subset has been changed by the
+        # user. Update the displayed results.
+        # Update the stored state (persistent settings)
         self.categoriesCheckState = self.getHierarchyCheckState()
         categories = self.selectedCategories()
 
         if self.data is not None:
-            if self.no_gene_matching() or not set(categories) <= set(self.currentAnnotatedCategories):
+            if self._nogenematching() or \
+                    not set(categories) <= set(self.currentAnnotatedCategories):
                 self.updateAnnotations()
             else:
+                # compute FDR according the selected categories
+                self.compute_fdr()
                 self.filterAnnotationsChartView()
 
     def updateGeneMatcherSettings(self):
+        raise NotImplementedError
+
         from .OWGOEnrichmentAnalysis import GeneMatcherDialog
         dialog = GeneMatcherDialog(self, defaults=self.geneMatcherSettings, enabled=[True] * 4, modal=True)
         if dialog.exec_():
             self.geneMatcherSettings = [getattr(dialog, item[0]) for item in dialog.items]
-            self.loadedGenematcher = "None"
-            if self.data:
+            self._invalidateGeneMatcher()
+            if self.data is not None:
                 self.updateAnnotations()
 
-    def updateGenematcher(self):
+    def _genematcher(self):
+        """
+        Return a Future[gene.SequenceMatcher]
+        """
         taxid = self.taxid_list[self.speciesIndex]
-        if taxid != self.loadedGenematcher:
-            self.progressBarInit()
-            call = self.asyncCall(obiGene.matcher, name="Gene Matcher", blocking=True, thread=self.thread())
-            call.connect(call, SIGNAL("progressChanged(float)"), self.progressBarSet)
-            with DownloadProgress.setredirect(call.emitProgressChanged):
-#            with orngServerFiles.DownloadProgress.setredirect(self.progressBarSet):
-                matchers = [obiGene.GMGO, obiGene.GMKEGG, obiGene.GMNCBI, obiGene.GMAffy]
-                if any(self.geneMatcherSettings) and taxid != -1:
-                    call.__call__([gm(taxid) for gm, use in zip(matchers, self.geneMatcherSettings) if use])
-                    self.genematcher = call.get_result()
-#                    self.genematcher = obiGene.matcher([gm(taxid) for gm, use in zip(matchers, self.geneMatcherSettings) if use])
-                else:
-                    call.__call__([])
-                    self.genematcher = call.get_result()
-                self.loadedGenematcher = taxid
-            self.progressBarFinished()
 
-    def genesFromExampleTable(self, table):
-        if self.genesinrows:
-            genes = [attr.name for attr in table.domain.attributes]
-        else:
-            geneattr = self.geneAttrs[self.geneattr]
-            genes = [str(ex[geneattr]) for ex in table]
-        return genes
+        current, matcher_f = self.__genematcher
 
-    def clusterGenes(self):
-        return self.genesFromExampleTable(self.data)
+        if taxid == current and \
+                not matcher_f.cancelled():
+            return matcher_f
 
-    def reference_from_ncbi(self):
-        taxid = self.taxid_list[self.speciesIndex]
-        call = self.asyncCall(obiGene.NCBIGeneInfo, (taxid,), name="Load reference genes", blocking=True, thread=self.thread())
-        call.connect(call, SIGNAL("progressChanged(float)"), self.progressBarSet)
-        with DownloadProgress.setredirect(call.emitProgressChanged):
-            call.__call__()
-            return call.get_result()
+        self._invalidateGeneMatcher()
 
-    def _cached_name_lookup(self, func, cache):
-        def f(name, cache=cache):
-            if name not in cache:
-                cache[name] = func(name)
-            return cache[name]
-        return f
+        if taxid is None:
+            self.__genematcher = (None, fulfill(gene.matcher([])))
+            return self.__genematcher[1]
 
-    def mapGeneNames(self, names, cache=None, passUnknown=False):
-        if cache is not None:
-            umatch = self._cached_name_lookup(self.genematcher.umatch, cache)
-        else:
-            umatch = self.genematcher.umatch
-        if passUnknown:
-            return [umatch(name) or name for name in names]
-#            return [(mapped_name or name, mapped_name is not None) for mapped_name, name in zip(mapped, names)]
-        return [n for n in [umatch(name) for name in names] if n is not None]
+        matchers = [gene.GMGO, gene.GMKEGG, gene.GMNCBI, gene.GMAffy]
+        matchers = [m for m, use in zip(matchers, self.geneMatcherSettings)
+                    if use]
 
-    def enrichment(self, geneset, cluster, reference, pval=obiProb.Hypergeometric(), cache=None):
-        genes = set(self.mapGeneNames(geneset.genes, cache, passUnknown=False))
+        def create():
+            return gene.matcher([m(taxid) for m in matchers])
 
-        cmapped = genes.intersection(cluster)
-        rmapped = genes.intersection(reference)
-        return (cmapped, rmapped, pval.p_value(len(cmapped), len(reference), len(rmapped), len(cluster)), float(len(cmapped)) / (len(cluster) or 1) / (float(len(rmapped) or 1) / (len(reference) or 1))) # TODO: compute all statistics here
+        matcher_f = self._executor.submit(create)
+        self.__genematcher = (taxid, matcher_f)
+        return self.__genematcher[1]
+
+    def _nogenematching(self):
+        return self.taxid is None or not any(self.geneMatcherSettings)
 
     def updateAnnotations(self):
-        if not self.taxid_list:
-            return
-        self.updatingAnnotationsFlag = True
-        self.annotationsChartView.clear()
-        self.error([0, 1])
-        if not self.genesinrows and len(self.geneAttrs) == 0:
-            self.error(0, "Input data contains no attributes with gene names")
-            self.updatingAnnotationsFlag = False
+        if self.data is None:
             return
 
-        self.updateGenematcher()
+        assert not self.__state & OWSetEnrichment.Initializing
+        self._cancelPending()
+        self._clearView()
+
+        self.Warning.clear()
+        self.Error.clear()
+
+        if not self.genesinrows and len(self.geneAttrs) == 0:
+            self.Error.no_gene_names()
+            return
+
+        self.__state = OWSetEnrichment.RunningEnrichment
+
+        taxid = self.taxid_list[self.speciesIndex]
+        self.taxid = taxid
+
+        categories = self.selectedCategories()
+
+        clusterGenes = self.genesFromTable(self.data)
+
+        if self.referenceData is not None and self.useReferenceData:
+            referenceGenes = self.genesFromTable(self.referenceData)
+        else:
+            referenceGenes = None
+
+        self.currentAnnotatedCategories = categories
+
+        genematcher = self._genematcher()
 
         self.progressBarInit()
-        self.currentAnnotatedCategories = categories = self.selectedCategories()
 
         ## Load collections in a worker thread
-        call = self.asyncCall(obiGeneSets.collections, categories, name="Loading collections", blocking=True, thread=self.thread())
-        call.connect(call, SIGNAL("progressChanged(float)"), self.progressBarSet)
-        with DownloadProgress.setredirect(call.emitProgressChanged):
-            call.__call__()
-            collections = list(call.get_result())
+        # TODO: Use cached collections if already loaded and
+        # use ensure_genesetsdownloaded with progress report (OWSelectGenes)
+        collections = self._executor.submit(geneset.collections, *categories)
 
-        clusterGenes = self.clusterGenes()
-        cache = {}
+        def refset_null():
+            """Return the default background reference set"""
+            col = collections.result()
+            return reduce(operator.ior, (set(g.genes) for g in col), set())
 
-        referenceGenes = self.genesFromExampleTable(self.referenceData) \
-            if (self.referenceData and self.useReferenceData) else None
+        def refset_ncbi():
+            """Return all NCBI gene names"""
+            geneinfo = gene.NCBIGeneInfo(taxid)
+            return set(geneinfo.keys())
 
-        if self.no_gene_matching():
-            if referenceGenes == None:
-                referenceGenes = set()
-                for g in collections:
-                    referenceGenes.update(set(g.genes))
-            self.genematcher.set_targets(referenceGenes)
+        def namematcher():
+            matcher = genematcher.result()
+            match = matcher.set_targets(ref_set.result())
+            match.umatch = memoize(match.umatch)
+            return match
+
+        def map_unames():
+            matcher = namematcher.result()
+            query = list(filter(None, map(matcher.umatch, querynames)))
+            reference = list(filter(None, map(matcher.umatch, ref_set.result())))
+            return query, reference
+
+        if self._nogenematching():
+            if referenceGenes is None:
+                ref_set = self._executor.submit(refset_null)
+            else:
+                ref_set = fulfill(referenceGenes)
         else:
             if referenceGenes == None:
-                referenceGenes = self.reference_from_ncbi()
-            self.genematcher.set_targets(referenceGenes)
-            referenceGenes = set(self.mapGeneNames(referenceGenes, cache, passUnknown=False))
+                ref_set = self._executor.submit(refset_ncbi)
+            else:
+                ref_set = fulfill(referenceGenes)
 
-        countAll = len(set(clusterGenes))
-        infoText = "%i unique names on input\n" % countAll
-        self.progressBarSet(1)
-        clusterGenes = set(self.mapGeneNames(clusterGenes, cache, passUnknown=False))
-        
-        self.progressBarSet(2)
-        if self.no_gene_matching():
-            pass
-        else:
-            self.progressBarSet(2)
-            infoText += "%i (%.1f) gene names matched" % (len(clusterGenes), 100.0 * len(clusterGenes) / countAll)
-        self.infoBox.setText(infoText)
+        namematcher = self._executor.submit(namematcher)
+        querynames = clusterGenes
 
-        results = []
-        from Orange.orng.orngMisc import progressBarMilestones
+        state = types.SimpleNamespace()
+        state.query_set = clusterGenes
+        state.reference_set = referenceGenes
+        state.namematcher = namematcher
+        state.query_count = len(set(clusterGenes))
+        state.reference_count = (len(set(referenceGenes))
+                                 if referenceGenes is not None else None)
 
-        milestones = progressBarMilestones(len(collections), 100)
-        for i, geneset in enumerate(collections):
-            results.append((geneset, self.enrichment(geneset, clusterGenes, referenceGenes, cache=cache)))
-            if i in milestones:
-                self.progressBarSet(100.0 * i / len(collections))
+        state.cancelled = False
 
-        self.annotationsChartView.clear()
+        progress = methodinvoke(self, "_setProgress", (float,))
+        info = methodinvoke(self, "_setRunInfo", (str,))
 
-        maxCount = max([len(cm) for _, (cm, _, _, _) in results] + [1])
-        maxRefCount = max([len(rc) for _, (_, rc, _, _) in results] + [1])
-        countSpaces = int(math.ceil(math.log10(maxCount)))
-        refSpaces = int(math.ceil(math.log(maxRefCount)))
-        countFmt = "%"+str(countSpaces) + "s  (%.2f%%)"
-        refFmt = "%"+str(refSpaces) + "s  (%.2f%%)"
+        @withtraceback
+        def run():
+            info("Loading data")
+            match = namematcher.result()
+            query, reference = map_unames()
+            gscollections = collections.result()
 
-        self.filterCompleter.setModel(None)
+            results = []
+            info("Running enrichment")
+            p = 0
+            for i, gset in enumerate(gscollections):
+                genes = set(filter(None, map(match.umatch, gset.genes)))
+                enr = set_enrichment(genes, reference, query)
+                results.append((gset, enr))
+
+                if state.cancelled:
+                    raise UserInteruptException
+
+                pnew = int(100 * i / len(gscollections))
+                if pnew != p:
+                    progress(pnew)
+                    p = pnew
+            progress(100)
+            info("")
+            return query, reference, results
+
+        task = Task(function=run)
+        task.resultReady.connect(self.__on_enrichment_finished)
+        task.exceptionReady.connect(self.__on_enrichment_failed)
+        result = self._executor.submit(task)
+        state.results = result
+
+        self.state = state
+        self._updatesummary()
+
+    def __on_enrichment_failed(self, exception):
+        if not isinstance(exception, UserInteruptException):
+            print("ERROR:", exception, file=sys.stderr)
+            print(exception._traceback, file=sys.stderr)
+
+        self.progressBarFinished()
+        self.setStatusMessage("")
+        self.__state &= ~OWSetEnrichment.RunningEnrichment
+
+    def __on_enrichment_finished(self, results):
+        assert QThread.currentThread() is self.thread()
+        self.__state &= ~OWSetEnrichment.RunningEnrichment
+
+        query, reference, results = results
+
+        if self.annotationsChartView.model():
+            self.annotationsChartView.model().clear()
+
+        nquery = len(query)
+        nref = len(reference)
+        maxcount = max((len(e.query_mapped) for _, e in results),
+                       default=1)
+        maxrefcount = max((len(e.reference_mapped) for _, e in results),
+                          default=1)
+        nspaces = int(math.ceil(math.log10(maxcount or 1)))
+        refspaces = int(math.ceil(math.log(maxrefcount or 1)))
+        query_fmt = "%" + str(nspaces) + "s  (%.2f%%)"
+        ref_fmt = "%" + str(refspaces) + "s  (%.2f%%)"
+
+        def fmt_count(fmt, count, total):
+            return fmt % (count, 100.0 * count / (total or 1))
+
+        fmt_query_count = partial(fmt_count, query_fmt)
+        fmt_ref_count = partial(fmt_count, ref_fmt)
+
         linkFont = QFont(self.annotationsChartView.viewOptions().font)
         linkFont.setUnderline(True)
-        self.treeItems = []
-        for i, (geneset, (cmapped, rmapped, p_val, enrichment)) in enumerate(results):
-            if len(cmapped) > 0:
-                item = MyTreeWidgetItem(self.annotationsChartView, [", ".join(geneset.hierarchy), gsname(geneset)])
-                item.setData(2, Qt.DisplayRole, QVariant(countFmt % (len(cmapped), 100.0*len(cmapped)/countAll)))
-                item.setData(2, Qt.ToolTipRole, QVariant(len(cmapped))) # For filtering
-                item.setData(3, Qt.DisplayRole, QVariant(refFmt % (len(rmapped), 100.0*len(rmapped)/len(referenceGenes))))
-                item.setData(4, Qt.ToolTipRole, QVariant(fmtpdet(p_val)))
-                item.setData(4, Qt.DisplayRole, QVariant(fmtp(p_val)))
-                item.setData(4, 42, QVariant(p_val))
-                #column 5, FDR, is computed in filterAnnotationsChartView
-                item.setData(6, Qt.DisplayRole, QVariant(enrichment))
-                item.setData(6, Qt.ToolTipRole, QVariant("%.3f" % enrichment))
-                item.geneset= geneset
-                self.treeItems.append(item)
-                if geneset.link:
-                    item.setData(1, LinkRole, QVariant(geneset.link))
-                    item.setToolTip(1, geneset.link)
-                    item.setFont(1, linkFont)
-                    item.setForeground(1, QColor(Qt.blue))
 
-        if not self.treeItems:
-            self.warning(0, "No enriched sets found.")
+        def item(value=None, tooltip=None, user=None):
+            si = QStandardItem()
+            if value is not None:
+                si.setData(value, Qt.DisplayRole)
+            if tooltip is not None:
+                si.setData(tooltip, Qt.ToolTipRole)
+            if user is not None:
+                si.setData(user, Qt.UserRole)
+            else:
+                si.setData(value, Qt.UserRole)
+            return si
+
+        model = self.source_model
+
+        for i, (gset, enrich) in enumerate(results):
+            if len(enrich.query_mapped) == 0:
+                continue
+            nquery_mapped = len(enrich.query_mapped)
+            nref_mapped = len(enrich.reference_mapped)
+
+            row = [
+                item(", ".join(gset.hierarchy)),
+                item(gsname(gset), tooltip=gset.link),
+                item(fmt_query_count(nquery_mapped, nquery),
+                     tooltip=nquery_mapped, user=nquery_mapped),
+                item(fmt_ref_count(nref_mapped, nref),
+                     tooltip=nref_mapped, user=nref_mapped),
+                item(fmtp(enrich.p_value), user=enrich.p_value),
+                item(),  # column 5, FDR, is computed in filterAnnotationsChartView
+                item(enrich.enrichment_score,
+                     tooltip="%.3f" % enrich.enrichment_score,
+                     user=enrich.enrichment_score)
+            ]
+            row[0].geneset = gset
+            row[0].enrichment = enrich
+            row[1].setData(gset.link, gui.LinkRole)
+            row[1].setFont(linkFont)
+            row[1].setForeground(QColor(Qt.blue))
+
+            model.appendRow(row)
+
+        self.annotationsChartView.selectionModel().selectionChanged.connect(
+            self.commit
+        )
+
+        if not model.rowCount():
+            self.Warning.no_sets_found()
         else:
-            self.warning(0)
+            # compute FDR according the selected categories
+            self.compute_fdr()
+            # set source model if there are sets found
+            self.filterAnnotationsChartView()
+            self.proxy_model.setSourceModel(model)
+            self.Warning.clear()
 
-        allnames = set(as_unicode(gsname(geneset))
+        self._updatesummary()
+
+        allnames = set(gsname(geneset)
                        for geneset, (count, _, _, _) in results if count)
 
         allnames |= reduce(operator.ior,
                            (set(word_split(name)) for name in allnames),
                            set())
 
+        self.filterCompleter.setModel(None)
         self.completerModel = QStringListModel(sorted(allnames))
         self.filterCompleter.setModel(self.completerModel)
 
-        
         if results:
-            self.annotationsChartView.setItemDelegateForColumn(6, BarItemDelegate(self, scale=(0.0, max(t[1][3] for t in results))))
-        self.annotationsChartView.setItemDelegateForColumn(1, LinkStyledItemDelegate(self.annotationsChartView))
+            max_score = max((e.enrichment_score for _, e in results
+                             if np.isfinite(e.enrichment_score)),
+                            default=1)
 
-        for i in range(self.annotationsChartView.columnCount()):
-            self.annotationsChartView.resizeColumnToContents(i)
+            self.annotationsChartView.setItemDelegateForColumn(
+                6, BarItemDelegate(self, scale=(0.0, max_score))
+            )
 
-        self.annotationsChartView.setColumnWidth(1, min(self.annotationsChartView.columnWidth(1), 300))
+        self.annotationsChartView.setItemDelegateForColumn(
+            1, gui.LinkStyledItemDelegate(self.annotationsChartView)
+        )
+
+        header = self.annotationsChartView.header()
+        for i in range(model.columnCount()):
+            sh = self.annotationsChartView.sizeHintForColumn(i)
+            sh = max(sh, header.sectionSizeHint(i))
+            self.annotationsChartView.setColumnWidth(i, max(min(sh, 300), 30))
+#             self.annotationsChartView.resizeColumnToContents(i)
+
         self.progressBarFinished()
-        self.updatingAnnotationsFlag = False
-        QTimer.singleShot(50, self.filterAnnotationsChartView)
+        self.setStatusMessage("")
 
-    def filterAnnotationsChartView(self, filterString=""):
-        if self.updatingAnnotationsFlag:
+    def _updatesummary(self):
+        state = self.state
+        if state is None:
+            self.Error.no_data_onInput()
+            self.Warning.clear()
+            self.infoBox.setText("No data on input.\n")
             return
-        categories = set(", ".join(cat) for cat, taxid in self.selectedCategories())
 
-    
-        filterString = str(self.filterLineEdit.text()).lower()
+        text = "{.query_count} unique names on input\n".format(state)
 
-        #hide categories
-        itemsHiddenCat = []
-        for item in self.treeItems:
-            item_cat = str(item.data(0, Qt.EditRole).toString())
-            geneset = gsname(item.geneset).lower()
-            hidden = item_cat not in categories
-            itemsHiddenCat.append(hidden)
-        
-        #compute FDR according the selected categories
-        pvals = [ _toPyObject(item.data(4, 42)) for item, hidden in zip(self.treeItems, itemsHiddenCat) if not hidden ]
-        fdrs = obiProb.FDR(pvals)
-
-        #update FDR for the selected collections and apply filtering rules
-        fdri = 0
-        itemsHidden = []
-        for item, hidden in zip(self.treeItems, itemsHiddenCat):
-            if not hidden:
-                fdr = fdrs[fdri]
-                fdri += 1
-
-                count, pval = _toPyObject(item.data(2, Qt.ToolTipRole)), _toPyObject(item.data(4, 42))
-
-                hidden = (self.useMinCountFilter and count < self.minClusterCount) or \
-                         (self.useMaxPValFilter and pval > self.maxPValue) or \
-                         (self.useMaxFDRFilter and fdr > self.maxFDR)
-                
-                if not hidden:
-                    item.setData(5, Qt.ToolTipRole, QVariant(fmtpdet(fdr)))
-                    item.setData(5, Qt.DisplayRole, QVariant(fmtp(fdr)))
-                    item.setData(5, 42, QVariant(fdr))
-
-            item.setHidden(hidden)
-            itemsHidden.append(hidden)
-                
-
-        if self.treeItems and all(itemsHidden):
-            self.information(0, "All sets were filtered out.")
+        if state.results.done() and not state.results.exception():
+            mapped, _, _ = state.results.result()
+            ratio_mapped = (len(mapped) / state.query_count
+                            if state.query_count else 0)
+            text += ("%i (%.1f%%) gene names matched" %
+                     (len(mapped), 100.0 * ratio_mapped))
+        elif not state.results.done():
+            text += "..."
         else:
-            self.information(0)
+            text += "<Error {}>".format(str(state.results.exception()))
+        self.infoBox.setText(text)
 
-    def invalidate(self):
-        if self.autocommit:
-            self.commit()
-        else:
-            self._changed = True
+        # TODO: warn on no enriched sets found (i.e no query genes
+        # mapped to any set)
+
+    def return_filter_values(self):
+        categories = set(", ".join(category) for category, _ in self.selectedCategories())
+        return {
+            "useMinCountFilter": self.useMinCountFilter,
+            "useMaxPValFilter": self.useMaxPValFilter,
+            "minClusterCount": self.minClusterCount,
+            "useMaxFDRFilter": self.useMaxFDRFilter,
+            "maxPValue": self.maxPValue,
+            "categories": categories,
+            "maxFDR": self.maxFDR
+        }
+
+    def compute_fdr(self):
+        selected_categories = self.return_filter_values().get('categories')
+        data_model = self.source_model
+
+        # get pvalues of rows that match selected category
+        pvals = [(row_index, data_model.index(row_index, 4).data(role=Qt.UserRole))
+                 for row_index in range(data_model.rowCount())
+                 if data_model.index(row_index, 0).data(role=Qt.DisplayRole) in selected_categories]
+
+        fdrs = utils.stats.FDR([pval for _, pval in pvals])
+
+        # set calculated values to the data model
+        for (row_index, pval), fdr in zip(pvals, fdrs):
+            fdr_item = data_model.item(row_index, 5)
+            fdr_item.setData(fmtpdet(fdr), Qt.ToolTipRole)
+            fdr_item.setData(fmtp(fdr), Qt.DisplayRole)
+            fdr_item.setData(fdr, Qt.UserRole)
+
+    def filterAnnotationsChartView(self):
+        if self.__state & OWSetEnrichment.RunningEnrichment:
+            return
+
+        # set string pattern
+        self.proxy_model._pattern = str(self.filterLineEdit.text())
+        # set filter values to proxy model
+        self.proxy_model.set_filter_values(self.return_filter_values())
+        # filter model
+        self.proxy_model.invalidateFilter()
+
+        self._updatesummary()
+
+    @Slot(float)
+    def _setProgress(self, value):
+        assert QThread.currentThread() is self.thread()
+        self.progressBarSet(value, processEvents=None)
+
+    @Slot(str)
+    def _setRunInfo(self, text):
+        self.setStatusMessage(text)
 
     def commit(self):
-        selected = self.annotationsChartView.selectedItems()
-        genesets = [item.geneset for item in selected]
-        cache = {}
-        mappedNames = set(self.mapGeneNames(reduce(set.union, [geneset.genes for geneset in genesets], set()), cache))
-        if self.genesinrows:
-            mapped = [attr for attr in self.data.domain.attributes if self.genematcher.umatch(attr.name) in mappedNames]
-            newdomain = orange.Domain(mapped, self.data.domain.classVar)
-            newdomain.addmetas(self.data.domain.getmetas())
-            data = orange.ExampleTable(newdomain, self.data)
+        if self.data is None or \
+                self.__state & OWSetEnrichment.RunningEnrichment:
+            return
+
+        model = self.source_model
+        rows = self.annotationsChartView.selectionModel().selectedRows(0)
+        selected = [model.item(index.row(), 0) for index in rows]
+        mapped = reduce(operator.ior,
+                        (set(item.enrichment.query_mapped)
+                         for item in selected),
+                        set())
+        assert self.state.namematcher.done()
+        matcher = self.state.namematcher.result()
+
+        axis = 1 if self.genesinrows else 0
+        if axis == 1:
+            mapped = [attr for attr in self.data.domain.attributes
+                      if matcher.umatch(attr.name) in mapped]
+
+            newdomain = Orange.data.Domain(
+                mapped, self.data.domain.class_vars, self.data.domain.metas)
+            data = self.data.from_table(newdomain, self.data)
         else:
             geneattr = self.geneAttrs[self.geneattr]
-            selected = [1 if self.genematcher.umatch(str(ex[geneattr])) in mappedNames else 0
-                        for ex in self.data]
-            data = self.data.select(selected)
-
+            selected = [i for i, ex in enumerate(self.data)
+                        if matcher.umatch(str(ex[geneattr])) in mapped]
+            data = self.data[selected]
         self.send("Data subset", data)
-        self._changed = False
 
-    def sendReport(self):
-        self.reportSettings("Settings", [("Organism", obiTaxonomy.name(self.taxid_list[self.speciesIndex]))])
-        self.reportSettings("Filter", [("Min cluster size", self.minClusterCount if self.useMinCountFilter else 0),
-                                       ("Max p-value", self.maxPValue if self.useMaxPValFilter else 1.0),
-                                       ("Max FDR", self.maxFDR if self.useMaxFDRFilter else 1.0)])
-
-        self.reportSubsection("Annotations")
-        self.reportRaw(reportItemView(self.annotationsChartView))
-
-    def onStateChange(self, stateType, id, text):
-        if stateType == "Warning" or stateType == "Info":
-            self.annotationsChartView._userMessage = text
-            self.annotationsChartView.viewport().update()
+    def onDeleteWidget(self):
+        if self.state is not None:
+            self._cancelPending()
+            self.state = None
+        self._executor.shutdown(wait=False)
 
 
-def reportItemView(view):
-    model = view.model()
-    return reportItemModel(view, model)
-
-def reportItemModel(view, model, index=QModelIndex()):
-    if not index.isValid() or model.hasChildren(index):
-        columnCount, rowCount = model.columnCount(index), model.rowCount(index)
-        if not index.isValid():
-            text = '<table>\n<tr>' + ''.join('<th>%s</th>' % model.headerData(i, Qt.Horizontal, Qt.DisplayRole).toString() for i in range(columnCount)) +'</tr>\n'
-        else:
-#            variant = model.data(index, Qt.DisplayRole)
-#            text = '<table' + (' caption="%s"' % variant.toString() if variant.isValid() else '') + '>\n'
-            pass
-        text += ''.join('<tr>' + ''.join('<td>' + reportItemModel(view, model, model.index(row, column, index)) + '</td>' for column in range(columnCount)) + '</tr>\n' for row in range(rowCount) if not view.isRowHidden(row, index))
-        text += '</table>'
-        return text
-    else:
-        variant = model.data(index, Qt.DisplayRole)
-        return str(variant.toString()) if variant.isValid() else ""
+class UserInteruptException(Exception):
+    pass
 
 
-class DownloadProgress(ConsoleProgressBar):
-    redirect = None
-    lock = threading.RLock()
+from collections import namedtuple
 
-    def __init__(self, filename, size):
-        print "Downloading", filename
-        ConsoleProgressBar.__init__(self, "progress:", 20)
-        self.size = size
-        self.starttime = time.time()
-        self.speed = 0.0
-
-    def sizeof_fmt(self, num):
-        return serverfiles.sizeformat(num)
-
-    def getstring(self):
-        elapsed = max(time.time() - self.starttime, 0.1)
-        speed = max(int(self.state * self.size / 100.0 / elapsed), 1)
-        eta = (100 - self.state) * self.size / 100.0 / speed
-        return ConsoleProgressBar.getstring(self) + \
-               "  %s  %12s/s  %3i:%02i ETA" % (self.sizeof_fmt(self.size),
-                                               self.sizeof_fmt(speed),
-                                               eta / 60, eta % 60)
-
-    def __call__(self, *args, **kwargs):
-        ret = ConsoleProgressBar.__call__(self, *args, **kwargs)
-        if self.redirect:
-            self.redirect(self.state)
-        return ret
-
-    class RedirectContext(object):
-        def __enter__(self):
-            DownloadProgress.lock.acquire()
-            return DownloadProgress
-
-        def __exit__(self, ex_type, value, tb):
-            DownloadProgress.redirect = None
-            DownloadProgress.lock.release()
-            return False
-
-    @classmethod
-    def setredirect(cls, redirect):
-        cls.redirect = staticmethod(redirect)
-        return cls.RedirectContext()
-
-    @classmethod
-    def __enter__(cls):
-        cls.lock.acquire()
-        return cls
-
-    @classmethod
-    def __exit__(cls, exc_type, exc_value, traceback):
-        cls.lock.release()
-        return False
+enrichment_res = namedtuple(
+    "enrichment_result",
+    ["query_mapped",      #:: list
+     "reference_mapped",  #:: list
+     "p_value",           #:: float
+     "enrichment_score"   #:: float
+     ]
+)
 
 
+def set_enrichment(target, reference, query,
+                   prob=utils.stats.Hypergeometric()):
+    """
+    :param set query: query set
+    :param set target: target set
+    :param set reference: the reference set
 
-if __name__ == "__main__":  
-    import cProfile
+    """
+    assert len(reference) > 0
+    query_mapped = target.intersection(query)
+    reference_mapped = target.intersection(reference)
 
+    query_p = len(query_mapped) / len(query) if query else np.nan
+    ref_p = len(reference_mapped) / len(reference) if reference else np.nan
+    enrichment = query_p / ref_p if ref_p else np.nan
+
+    return enrichment_res(
+        list(query_mapped), list(reference_mapped),
+        prob.p_value(len(query_mapped), len(reference),
+                     len(reference_mapped), len(query)),
+        enrichment
+    )
+
+
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = OWSetEnrichment()
-    #data = orange.ExampleTable("yeast-class-RPR.tab")
-    #data = orange.ExampleTable("/home/marko/orange-pubchem-data/pug/chems_matrix.tab")
-    data = orange.ExampleTable("/home/marko/comp81_master.tab")
-    w.loadSettings()
-#    data = orange.ExampleTable("../human")
-#    print cProfile.runctx("w.setData(data)", globals(), locals())
+#     data = Orange.data.Table("yeast-class-RPR.tab")
+    data = Orange.data.Table("brown-selected")
     w.setData(data)
-    #w.setReference(data)
+#     w.setReference(data)
+    w.handleNewSignals()
     w.show()
     app.exec_()
     w.saveSettings()
-
-
+    w.onDeleteWidget()

@@ -1,8 +1,9 @@
 from unittest import TestCase
-from server_update import sf_local
+
 from orangecontrib.bio import taxonomy
-from orangecontrib.bio.widgets3.OWGeneInfo import ncbi_info
 from orangecontrib.bio.gene import NCBIGeneInfo
+from orangecontrib.bio.widgets.OWGeneInfo import ncbi_info
+from server_update import sf_local
 
 
 class NCBIGeneInfoTest(TestCase):

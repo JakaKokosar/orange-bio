@@ -1,44 +1,34 @@
-"""
-<name>GenExpress</name>
-<description>Expression data from GenExpress.</description>
-<icon>icons/GenCloud.svg</icon>
-<priority>36</priority>
-"""
-
-from __future__ import absolute_import
-
-import Orange
-import genesis
-
-import sys, os
-from collections import defaultdict
+import sys
+import os
 import math
-from datetime import date
-import numpy as np
+import io
+import gzip
 
-from Orange.orng import orngEnviron
-from Orange.OrangeWidgets import OWGUI
-from Orange.OrangeWidgets.OWWidget import *
+from collections import defaultdict
 
-import orangecontrib.bio.widgets.OWPIPAx as OWPIPAx
+from AnyQt.QtWidgets import (
+    QSizePolicy, QTreeWidget, QTreeWidgetItem, QLineEdit,
+)
+from AnyQt.QtCore import Qt, QSize, QTimer, QStringListModel
 
 import requests
-from ..utils import compat
-from orangecontrib.bio import obiDicty
+import genesis
 
-NAME = "GenExpress"
-DESCRIPTION = "Expression data from GenExpress."
-ICON = "icons/GenCloud.svg"
-PRIORITY = 36
+import Orange.data
 
-INPUTS = []
-OUTPUTS = [("Example table", Orange.data.Table)]
+from Orange.widgets import widget, gui, settings
+from Orange.widgets.utils.datacaching import data_hints
 
-median = obiDicty.median
-transformValues = obiDicty.transformValues
-averageAttributes = obiDicty.averageAttributes
-example_tables = obiDicty.example_tables
-CallBack = obiDicty.CallBack
+from orangecontrib.bio import dicty
+from orangecontrib.bio.utils import environ, compat
+from .OWPIPAx import SelectionByKey, SelectionSetsWidget, SortedListWidget
+
+median = dicty.median
+transformValues = dicty.transformValues
+averageAttributes = dicty.averageAttributes
+example_tables = dicty.example_tables
+CallBack = dicty.CallBack
+
 
 def to_text(x):
     if isinstance(x, dict):
@@ -46,13 +36,15 @@ def to_text(x):
     else:
         return x
 
+
 class GenCountConnectionException(Exception):
     pass
+
 
 class Genesis(object):
 
     #ignore when joining replicates
-    IGNORE_REPLICATE = ["Replicate", "id", "ID", "Name" ]
+    IGNORE_REPLICATE = ["Replicate", "id", "ID", "Name"]
 
     #FIXME get this from the server
     LABELS = [
@@ -75,7 +67,8 @@ class Genesis(object):
     ]
 
     def __init__(self, address, cache=None,
-                 username='anonymous@genialis.com', password='anonymous', connect=True):
+                 username='anonymous@genialis.com', password='anonymous',
+                 connect=True):
 
         """
         :param str address: The address of the API.
@@ -97,10 +90,8 @@ class Genesis(object):
     @property
     def gen(self):
         if not self._gen:
-            try:
-                self._gen = genesis.Genesis(self.username, self.password, self.address)
-            except:
-                raise GenCountConnectionException("Connection needed")
+            self._gen = genesis.Genesis(self.username, self.password,
+                                        self.address)
         return self._gen
 
     @property
@@ -111,8 +102,9 @@ class Genesis(object):
 
     def projects(self, reload=False, bufver="0"):
         def a(self):
-            return { k:str(p) for k,p in self.gen.projects().items() }
-        return self._buffer_fn("projects" + "|||" + self.username, bufver, reload, a, self)
+            return {k: str(p) for k, p in self.gen.projects().items()}
+        return self._buffer_fn("projects" + "|||" + self.username, bufver,
+                               reload, a, self)
 
     def result_types(self, reload=False, bufver="0"):
         """Return a list of available result types."""
@@ -121,13 +113,14 @@ class Genesis(object):
             types = {}
             for o in objects:
                 an = o.annotation
-                for path, a in an.iteritems():
-                    if path.startswith('output') and a['type'] == 'basic:file:' \
-                        and not path.startswith('output.proc.'):
-                            types[a['name']] = a['label']
+                for path, a in an.items():
+                    if path.startswith('output') and \
+                            a['type'] == 'basic:file:' and \
+                            not path.startswith('output.proc.'):
+                        types[a['name']] = a['label']
 
             # Sort keys by labels
-            keys = [typ for typ, label in sorted(types.items(), key=lambda x: x[1])]
+            keys = [typ for typ, _ in sorted(types.items(), key=lambda x: x[1])]
             try:
                 # Push field exp to the top (exp is considered default)
                 keys.remove('exp')
@@ -137,7 +130,9 @@ class Genesis(object):
                 pass
 
             return keys, types
-        return self._buffer_fn(self.projectid + "|||" + self.username + "|||" + "result_types", bufver, reload, a, self)
+        return self._buffer_fn(self.projectid + "|||" + self.username +
+                               "|||" + "result_types", bufver, reload,
+                               a, self)
 
     def results_list(self, rtype, reload=False, bufver="0"):
         """Return a list of available gene expressions for a specific
@@ -152,22 +147,25 @@ class Genesis(object):
             for o in objects:
                 an = o.annotation
                 ok = False
-                for path, a in an.iteritems():
-                    if path.startswith('output') and a['type'] == 'basic:file:' \
-                        and a["name"] == rtype:
-                            ok = True
+                for path, a in an.items():
+                    if path.startswith('output') and \
+                            a['type'] == 'basic:file:' and a["name"] == rtype:
+                        ok = True
                 if ok:
                     rdict[o.id] = an
                     rdict[o.id]["date_modified"] = o.date_modified
             return rdict
-        return self._buffer_fn(self.projectid + "|||" + self.username + "|||" + "results_list"  + "|||" + str(rtype), bufver, reload, a, self)
+        return self._buffer_fn(self.projectid + "|||" + self.username +
+                               "|||" + "results_list" + "|||" + str(rtype),
+                               bufver, reload, a, self)
 
     def _from_buffer(self, addr):
         return self.buffer.get(self.address + "|v1||" + addr)
 
     def _to_buffer(self, addr, cont, version="0", autocommit=True):
         if self.buffer:
-            return self.buffer.add(self.address + "|v1||" + addr, cont, version=version, autocommit=autocommit)
+            return self.buffer.add(self.address + "|v1||" + addr, cont,
+                                   version=version, autocommit=autocommit)
 
     def _buffer_commit(self):
         if self.buffer:
@@ -197,41 +195,44 @@ class Genesis(object):
     def download(self, ids, rtype, reload=False, bufver="0"):
         objdic = self.results_list(rtype)
 
-        downloads = [] #what to download
+        downloads = []  # what to download
         for id in ids:
             o = objdic[id]
             field = None
-            for path, a in o.iteritems():
+            for path, a in o.items():
                 if path.startswith('output') and a['type'] == 'basic:file:' \
                     and not path.startswith('output.proc.'):
                         if a["name"] == rtype:
                             field = a["value"]["file"]
             downloads.append((id, field))
 
-        bufverfn = (lambda x: bufver) if isinstance(bufver, basestring) else bufver
+        bufverfn = (lambda x: bufver) if isinstance(bufver, str) else bufver
 
-        unbuffered = [] #what is missing
-        for id,field in downloads:
-            if not self._in_buffer(id + "|||" + rtype) == bufverfn(id) or reload:
+        unbuffered = []  # what is missing
+        for id, field in downloads:
+            if not self._in_buffer(id + "|||" + rtype) == bufverfn(id) or \
+                    reload:
                 unbuffered.append((id, field))
         unbufferedset = set(unbuffered)
 
         # newgen = [].__iter__()
         # if unbuffered:
         #     newgen = self.gen.download(unbuffered)
-        for id,field in downloads:
+        for id, field in downloads:
             if (id, field) in unbufferedset:
-                import gzip
-                import StringIO
-                response = self.gen.download([id], 'output.' + rtype).next()
-                response_gzipped = StringIO.StringIO(response.content)
-                response_content = gzip.GzipFile(fileobj=response_gzipped)
+                response = next(self.gen.download([id], 'output.' + rtype))
+                response_gzipped = io.BytesIO(response.content)
+                response_content = io.TextIOWrapper(
+                    gzip.GzipFile(fileobj=response_gzipped),
+                    encoding="utf-8")
+
                 out = []
                 for l in response_content.read().split('\n')[1:]:
                     if l:
                         gene, val = l.split('\t')
                         out.append((str(gene), str(val)))
-                self._to_buffer(id + "|||" + rtype, out, version=bufverfn(id), autocommit=True)
+                self._to_buffer(id + "|||" + rtype, out, version=bufverfn(id),
+                                autocommit=True)
                 yield out
             else:
                 yield self._from_buffer(id + "|||" + rtype)
@@ -239,7 +240,7 @@ class Genesis(object):
     def get_data(self, ids=None, result_type=None,
                  exclude_constant_labels=False, average=median,
                  callback=None, bufver="0", transform=None,
-                 allowed_labels=None, reload=False):
+                 allowed_labels=None, reload=False, namefn=None):
         """
         Return data in a :obj:`Orange.data.Table`. Each feature represents
         a sample and each row is a gene. The feature's ``.attributes``
@@ -289,11 +290,13 @@ class Genesis(object):
 
         cbc = CallBack(len(ids) + 3, optcb,
                        callbacks=99 - 20)
+
         et = example_tables(ids, spotmap={}, callback=cbc,
                             annots=read,
                             exclude_constant_labels=exclude_constant_labels,
                             chipfn=download_func,
-                            allowed_labels=allowed_labels)
+                            allowed_labels=allowed_labels,
+                            namefn=namefn)
         cbc.end()
 
         cbc = CallBack(2, optcb, callbacks=10)
@@ -316,7 +319,7 @@ class Genesis(object):
 def tfloat(s):
     try:
         return float(s)
-    except:
+    except ValueError:
         return None
 
 
@@ -330,28 +333,26 @@ class MyTreeWidgetItem(QTreeWidgetItem):
         return any(text.upper() in str(self.text(i)).upper() \
                    for i in range(self.columnCount()))
 
-    def __lt__(self, o1):
+    def __lt__(self, other):
         col = self.par.sortColumn()
-        if col in [8, 9]:  # WARNING: hardcoded column numbers
-            return tfloat(self.text(col)) < tfloat(o1.text(col))
-        else:
-            return QTreeWidgetItem.__lt__(self, o1)
+        if col in [TIMEPOINT_COLUMN, REPLICATE_COLUMN]:
+            left = tfloat(self.text(col))
+            right = tfloat(other.text(col))
+            if isinstance(left, float) and isinstance(right, float):
+                return left < right
+
+        return QTreeWidgetItem.__lt__(self, other)
 
 
 # set buffer file
-bufferpath = os.path.join(orngEnviron.directoryNames["bufferDir"], "genesis")
+bufferpath = os.path.join(environ.buffer_dir, "genesis")
 
 try:
     os.makedirs(bufferpath)
-except:
+except OSError:
     pass
 
 bufferfile = os.path.join(bufferpath, "database.sq3")
-
-SelectionByKey = OWPIPAx.SelectionByKey
-ListItemDelegate = OWPIPAx.ListItemDelegate
-SelectionSetsWidget = OWPIPAx.SelectionSetsWidget
-SortedListWidget = OWPIPAx.SortedListWidget
 
 # Mapping from PIPAx.results_list annotation keys to Header names.
 HEADER = [("_cached", "")] + Genesis.LABELS
@@ -359,134 +360,149 @@ HEADER = [("_cached", "")] + Genesis.LABELS
 # Index of unique_id
 ID_INDEX = 10
 
-SORTING_MODEL_LIST = \
-    ["Strain", "Experiment", "Genotype",
-     "Timepoint", "Growth", "Species",
-     "ID", "Name", "Replicate"]
+TIMEPOINT_COLUMN = 2
+REPLICATE_COLUMN = 3
+
+SORTING_MODEL_LIST = [
+    "Strain", "Experiment", "Genotype", "Timepoint", "Growth", "Genome",
+    "ID", "Name", "Replicate"]
 
 
-class OWGenExpress(OWWidget):
-    settingsList = ["server", "excludeconstant", "username", "password",
-                    "joinreplicates", "selectionSetsWidget.selections",
-                    "columnsSortingWidget.sortingOrder", "currentSelection",
-                    "log2", "experimentsHeaderState", "rtypei", "projecti", "serveri" ]
+class OWGenExpress(widget.OWWidget):
+    name = "GenExpress"
+    description = "Expression data from GenExpress."
+    icon = "../widgets/icons/GenCloud.svg"
+    priority = 36
 
-    def __init__(self, parent=None, signalManager=None, name="Genesis"):
-        OWWidget.__init__(self, parent, signalManager, name)
-        self.outputs = [("Example table", ExampleTable)]
+    inputs = []
+    outputs = [("Data", Orange.data.Table)]
+
+    username = settings.Setting("anonymous")
+    password = settings.Setting("")
+    log2 = settings.Setting(False)
+    transpose = settings.Setting(False)
+    rtypei = settings.Setting(0)
+    projecti = settings.Setting(0)
+    serveri = settings.Setting(0)
+    exnamei = settings.Setting(6)
+
+    excludeconstant = settings.Setting(False)
+    joinreplicates = settings.Setting(False)
+    currentSelection = settings.Setting(None)
+
+    experimentsHeaderState = settings.Setting({
+        name: False for _, name in HEADER[:ID_INDEX + 1]}
+    )
+
+    storedSortOrder = settings.Setting([])
+    storedSelections = settings.Setting([])
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
         self.servers = [
             ('https://dictyexpress.research.bcm.edu/', 'dictyExpress'),
             ('https://cloud.genialis.com/', 'Genialis'),
         ]
-        self.username = "anonymous"
-        self.password = ""
-        self.log2 = False
-        self.transpose = False
-        self.rtypei = 0
-        self.projecti = 0
-        self.serveri = 0
 
         self.selectedExperiments = []
-        self.buffer = obiDicty.CacheSQLite(bufferfile)
+        self.buffer = dicty.CacheSQLite(bufferfile)
 
         self.searchString = ""
-        self.excludeconstant = False
-        self.joinreplicates = False
-        self.currentSelection = None
 
         self.items = []
-
-        self.experimentsHeaderState = \
-                dict(((name, False) for _, name in HEADER[:ID_INDEX + 1]))
 
         self.result_types = []
 
         self.controlArea.setMaximumWidth(250)
         self.controlArea.setMinimumWidth(250)
 
-        """
-        OWGUI.button(self.controlArea, self, "Reload",
-                     callback=self.Reload)
-        """
-        box = OWGUI.widgetBox(self.controlArea, 'Project')
-        self.projectCB = OWGUI.comboBox(box, self, "projecti",
-                items=[],
-                callback=self.ProjectChosen)
+        box = gui.widgetBox(self.controlArea, 'Project')
+        self.projectCB = gui.comboBox(
+            box, self, "projecti", items=[], callback=self.ProjectChosen)
 
         self.projects = []
 
-        b = OWGUI.widgetBox(self.controlArea, "Selection bookmarks")
+        b = gui.widgetBox(self.controlArea, "Selection bookmarks")
         self.selectionSetsWidget = SelectionSetsWidget(self)
-        self.selectionSetsWidget.setSizePolicy(QSizePolicy.Preferred,
-                                               QSizePolicy.Maximum)
+        self.selectionSetsWidget.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+        def store_selections(modified):
+            if not modified:
+                self.storedSelections = self.selectionSetsWidget.selections
+        self.selectionSetsWidget.selectionModified.connect(store_selections)
+
         b.layout().addWidget(self.selectionSetsWidget)
 
-        OWGUI.separator(self.controlArea)
+        gui.separator(self.controlArea)
 
-        b = OWGUI.widgetBox(self.controlArea, "Sort output columns")
+        b = gui.widgetBox(self.controlArea, "Sort output columns")
         self.columnsSortingWidget = SortedListWidget(self)
-        self.columnsSortingWidget.setSizePolicy(QSizePolicy.Preferred,
-                                                QSizePolicy.Maximum)
+        self.columnsSortingWidget.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+        box = gui.widgetBox(self.controlArea, 'Experiment name')
+        self.experimentNameCB = gui.comboBox(
+            box, self, "exnamei", items=SORTING_MODEL_LIST)
+
         b.layout().addWidget(self.columnsSortingWidget)
         sorting_model = QStringListModel(SORTING_MODEL_LIST)
         self.columnsSortingWidget.setModel(sorting_model)
+        self.columnsSortingWidget.sortingOrder = self.storedSortOrder
 
-        self.columnsSortingWidget.sortingOrder = \
-                ["Strain", "Experiment", "Genotype", "Timepoint"]
+        def store_sort_order():
+            self.storedSortOrder = self.columnsSortingWidget.sortingOrder
+        self.columnsSortingWidget.sortingOrderChanged.connect(store_sort_order)
 
-        OWGUI.separator(self.controlArea)
+        gui.separator(self.controlArea)
 
-        box = OWGUI.widgetBox(self.controlArea, 'Expression Type')
-        self.expressionTypesCB = OWGUI.comboBox(box, self, "rtypei",
-                items=[],
-                callback=self.UpdateResultsList)
 
-        OWGUI.checkBox(self.controlArea, self, "excludeconstant",
-                       "Exclude labels with constant values"
-                       )
+        box = gui.widgetBox(self.controlArea, 'Expression Type')
+        self.expressionTypesCB = gui.comboBox(
+            box, self, "rtypei", items=[], callback=self.UpdateResultsList)
 
-        OWGUI.checkBox(self.controlArea, self, "joinreplicates",
-                       "Average replicates (use median)"
-                       )
+        gui.checkBox(self.controlArea, self, "excludeconstant",
+                     "Exclude labels with constant values")
 
-        OWGUI.checkBox(self.controlArea, self, "log2",
-                       "Logarithmic (base 2) transformation"
-                       )
+        gui.checkBox(self.controlArea, self, "joinreplicates",
+                     "Average replicates (use median)")
 
-        OWGUI.checkBox(self.controlArea, self, "transpose",
-                       "Genes as attributes"
-                       )
+        gui.checkBox(self.controlArea, self, "log2",
+                     "Logarithmic (base 2) transformation")
 
-        self.commit_button = OWGUI.button(self.controlArea, self, "&Commit",
-                                          callback=self.Commit)
+        gui.checkBox(self.controlArea, self, "transpose",
+                     "Genes as columns")
+
+        self.commit_button = gui.button(self.controlArea, self, "&Commit",
+                                        callback=self.Commit)
         self.commit_button.setDisabled(True)
 
-        OWGUI.rubber(self.controlArea)
+        gui.rubber(self.controlArea)
 
-        box = OWGUI.widgetBox(self.controlArea, 'Server')
-        OWGUI.comboBox(box, self, "serveri",
-                       items=[title for url, title in self.servers],
-                       callback=self.ServerChosen)
+        box = gui.widgetBox(self.controlArea, 'Server')
+        gui.comboBox(box, self, "serveri",
+                     items=[title for url, title in self.servers],
+                     callback=self.ServerChosen)
 
-        OWGUI.lineEdit(box, self, "username", "Username:",
-                       labelWidth=100,
-                       orientation='horizontal',
-                       callback=self.AuthChanged)
+        gui.lineEdit(box, self, "username", "Username:",
+                     labelWidth=100,
+                     orientation='horizontal',
+                     callback=self.AuthChanged)
 
-        self.passf = OWGUI.lineEdit(box, self, "password", "Password:",
-                                    labelWidth=100,
-                                    orientation='horizontal',
-                                    callback=self.AuthChanged)
+        self.passf = gui.lineEdit(box, self, "password", "Password:",
+                                  labelWidth=100,
+                                  orientation='horizontal',
+                                  callback=self.AuthChanged)
 
         self.passf.setEchoMode(QLineEdit.Password)
 
-        OWGUI.button(self.controlArea, self, "Clear cache",
-                     callback=self.clear_cache)
+        gui.button(self.controlArea, self, "Clear cache",
+                   callback=self.clear_cache)
 
-        OWGUI.lineEdit(self.mainArea, self, "searchString", "Search",
-                       callbackOnType=True,
-                       callback=self.SearchUpdate)
+        gui.lineEdit(self.mainArea, self, "searchString", "Search",
+                     callbackOnType=True,
+                     callback=self.SearchUpdate)
 
         self.headerLabels = [t[1] for t in HEADER]
 
@@ -496,34 +512,28 @@ class OWGenExpress(OWWidget):
         self.experimentsWidget.setRootIsDecorated(False)
         self.experimentsWidget.setSortingEnabled(True)
 
-        contextEventFilter = OWGUI.VisibleHeaderSectionContextEventFilter(
-                            self.experimentsWidget, self.experimentsWidget
-                            )
+        contextEventFilter = gui.VisibleHeaderSectionContextEventFilter(
+            self.experimentsWidget, self.experimentsWidget)
 
         self.experimentsWidget.header().installEventFilter(contextEventFilter)
-        self.experimentsWidget.setItemDelegateForColumn(0,
-                    OWGUI.IndicatorItemDelegate(self, role=Qt.DisplayRole)
-                    )
+        self.experimentsWidget.setItemDelegateForColumn(
+            0, gui.IndicatorItemDelegate(self, role=Qt.DisplayRole))
 
         self.experimentsWidget.setAlternatingRowColors(True)
 
-        self.connect(self.experimentsWidget.selectionModel(),
-                 SIGNAL("selectionChanged(QItemSelection, QItemSelection)"),
-                 self.onSelectionChanged)
+        self.experimentsWidget.selectionModel().selectionChanged.connect(
+            self.onSelectionChanged)
 
         self.selectionSetsWidget.setSelectionModel(
-                            self.experimentsWidget.selectionModel()
-                            )
+            self.experimentsWidget.selectionModel())
+        self.selectionSetsWidget.setSelections(self.storedSelections)
 
         self.mainArea.layout().addWidget(self.experimentsWidget)
 
-        self.loadSettings()
-
         self.restoreHeaderState()
 
-        self.connect(self.experimentsWidget.header(),
-                     SIGNAL("geometriesChanged()"),
-                     self.saveHeaderState)
+        self.experimentsWidget.header().geometriesChanged.connect(
+            self.saveHeaderState)
 
         self.dbc = None
 
@@ -531,7 +541,8 @@ class OWGenExpress(OWWidget):
 
         QTimer.singleShot(100, self.ConnectAndUpdate)
 
-        self.resize(800, 600)
+    def sizeHint(self):
+        return QSize(800, 600)
 
     def AuthSet(self):
         if len(self.username):
@@ -580,22 +591,19 @@ class OWGenExpress(OWWidget):
         self.result_types = []
 
         try:
-            self.dbc = Genesis(address=url,
-                                  username=username,
-                                  password=password,
-                                  cache=self.buffer)
+            self.dbc = Genesis(
+                address=url, username=username, password=password,
+                cache=self.buffer)
         except requests.exceptions.ConnectionError:
-            self.dbc = Genesis(address=url,
-                                  username=username,
-                                  password=password,
-                                  connect=False,
-                                  cache=self.buffer)
+            self.dbc = Genesis(
+                address=url, username=username, password=password,
+                connect=False, cache=self.buffer)
             self.warning(1, "Could not connect to server, working from cache.")
-        except Exception, ex:
-           self.error(1, "Wrong username or password.")
+        except Exception:
+            self.error(1, "Wrong username or password.")
 
         self.UpdateProjects()
-        self.UpdateExperimentTypes() #clear lists
+        self.UpdateExperimentTypes()  # clear lists
 
     def Reload(self):
         self.UpdateExperiments(reload=True)
@@ -621,9 +629,9 @@ class OWGenExpress(OWWidget):
 
     def UpdateProjects(self):
         self.projectCB.clear()
-        items = [desc for pid,desc in self.projects]
+        items = [desc for pid, desc in self.projects]
         self.projectCB.addItems(items)
-        #do not update anathing if the list if empty
+        #do not update anything if the list if empty
         if len(self.projects) > 0:
             self.projecti = max(0, min(self.projecti, len(self.projects) - 1))
 
@@ -631,7 +639,7 @@ class OWGenExpress(OWWidget):
 
         self.experimentsWidget.clear()
 
-        if not self.dbc or not self.dbc.projectid: #the connection did not succeed
+        if not self.dbc or not self.dbc.projectid:  # the connection did not succeed
             return
 
         self.items = []
@@ -646,12 +654,12 @@ class OWGenExpress(OWWidget):
         try:
             result_types, result_types_labels = self.dbc.result_types(reload=reload)
             sucind = True
-        except Exception, ex:
+        except Exception:
             try:
                 result_types, result_types_labels = self.dbc.result_types()
                 self.warning(0, "Can not access database - using cached data.")
                 sucind = True
-            except Exception, ex:
+            except Exception:
                 self.error(0, "Can not access database.")
 
         if sucind:
@@ -679,23 +687,17 @@ class OWGenExpress(OWWidget):
 
         self.UpdateExperiments(reload=reload)
 
-    def ServerChosen(self, reload=False):
-        #if self.projects:
-        #    self.dbc.projectid = self.projects[self.projecti][0]
-        #    self.UpdateExperiments(reload=reload)
-        print 'ServerChosen'
+    def ServerChosen(self):
         self.ConnectAndUpdate()
 
     def UpdateResultsList(self, reload=False):
-
-        results_list = {}
         results_list = self.dbc.results_list(self.rtype(), reload=reload)
         try:
             results_list = self.dbc.results_list(self.rtype(), reload=reload)
-        except Exception, ex:
+        except Exception:
             try:
                 results_list = self.dbc.results_list(self.rtype())
-            except Exception, ex:
+            except Exception:
                 self.error(0, "Can not access database.")
 
         self.results_list = results_list
@@ -703,7 +705,7 @@ class OWGenExpress(OWWidget):
         #softly change the view so that the selection stays the same
 
         items_shown = {}
-        for i,item in enumerate(self.items):
+        for i, item in enumerate(self.items):
             c = str(item.text(ID_INDEX))
             items_shown[c] = i
 
@@ -720,12 +722,14 @@ class OWGenExpress(OWWidget):
             else:
                 i += 1
 
-        delete_ind = set([ items_shown[i] for i in delete_items ])
-        self.items = [ it for i, it in enumerate(self.items) if i not in delete_ind ]
+        delete_ind = set([items_shown[i] for i in delete_items])
+        self.items = [it for i, it in enumerate(self.items)
+                      if i not in delete_ind]
 
         for r_annot in add_items:
             d = defaultdict(lambda: "?", self.results_list[r_annot])
-            row_items = [""] + [to_text(d.get(key, "?")) for key, _ in HEADER[1:]]
+            row_items = [""] + [to_text(d.get(key, "?"))
+                                for key, _ in HEADER[1:]]
             row_items[ID_INDEX] = r_annot
 
             ci = MyTreeWidgetItem(self.experimentsWidget, row_items)
@@ -738,26 +742,23 @@ class OWGenExpress(OWWidget):
 
         self.UpdateCached()
 
-
     def UpdateCached(self):
-
         if self.wantbufver and self.dbc:
 
             for item in self.items:
                 id = str(item.text(ID_INDEX))
                 version = self.dbc._in_buffer(id + "|||" + self.rtype())
                 value = " " if version == self.wantbufver(id) else ""
-                item.setData(0, Qt.DisplayRole, QVariant(value))
+                item.setData(0, Qt.DisplayRole, value)
 
     def SearchUpdate(self, string=""):
         for item in self.items:
-            item.setHidden(not all(s in item \
-                                   for s in self.searchString.split())
-                           )
+            item.setHidden(
+                not all(s in item for s in self.searchString.split()))
 
     def Commit(self):
 
-        pb = OWGUI.ProgressBar(self, iterations=100)
+        pb = gui.ProgressBar(self, iterations=100)
 
         table = None
 
@@ -770,46 +771,32 @@ class OWGenExpress(OWWidget):
         if self.log2:
             transfn = lambda x: math.log(x + 1.0, 2)
 
-        reverse_header_dict = dict((name, key) for key, name in HEADER)
+        reverse_header_dict = {name: name for key, name in HEADER}
+        reverse_header_dict["ID"] = "id"
 
-        hview = self.experimentsWidget.header()
-        shownHeaders = [label for i, label in \
-                        list(enumerate(self.headerLabels))[1:] \
-                        if not hview.isSectionHidden(i)
-                        ]
-
-        #allowed_labels = [reverse_header_dict.get(label, label) \
-        #for label in shownHeaders]
         allowed_labels = None
 
-        #if self.joinreplicates and "id" not in allowed_labels:
-        #    # need 'id' labels in join_replicates for attribute names
-        #    allowed_labels.append("id")
+        def namefn(a):
+            name = SORTING_MODEL_LIST[self.exnamei]
+            name = reverse_header_dict.get(name, "id")
+            return dict(a)[name]
 
         if len(ids):
-            table = self.dbc.get_data(ids=ids, result_type=self.rtype(),
-                          callback=pb.advance,
-                          exclude_constant_labels=self.excludeconstant,
-                          bufver=self.wantbufver,
-                          transform=transfn,
-                          allowed_labels=allowed_labels)
+            table = self.dbc.get_data(
+                ids=ids, result_type=self.rtype(),
+                callback=pb.advance,
+                exclude_constant_labels=self.excludeconstant,
+                bufver=self.wantbufver,
+                transform=transfn,
+                allowed_labels=allowed_labels,
+                namefn=namefn)
 
             if self.joinreplicates:
-                table = obiDicty.join_replicates(table,
+                table = dicty.join_replicates(table,
                     ignorenames=self.dbc.IGNORE_REPLICATE,
-                    namefn=None,
-                    avg=obiDicty.median
-                    )
-
-            if self.transpose:
-                experiments = [at for at in table.domain.variables]
-                attr = [compat.ContinuousVariable(name=ex['DDB'].value) for ex in table]
-                metavars = sorted(table.domain.variables[0].attributes.keys())
-                metavars = [compat.StringVariable(name=name) for name in metavars]
-                domain = compat.create_domain(attr, None, metavars)
-                X = np.array([[row[exp].value for exp in experiments] for row in table])
-                metas = [[exp.attributes[var.name] for var in metavars] for exp in experiments]
-                table = compat.create_table(domain, X.transpose().tolist(), None, metas)
+                    namefn="name",
+                    avg=dicty.median,
+                    fnshow=lambda x: " | ".join(map(str, x)))
 
             # Sort attributes
             sortOrder = self.columnsSortingWidget.sortingOrder
@@ -827,7 +814,7 @@ class OWGenExpress(OWWidget):
                     for a in vals:
                         float(a)
                     isnum[at] = True
-                except:
+                except ValueError:
                     isnum[at] = False
 
             def optfloat(x, at):
@@ -838,21 +825,30 @@ class OWGenExpress(OWWidget):
 
             def sorting_key(attr):
                 atts = attr.attributes
-                return tuple([optfloat(atts.get(reverse_header_dict[name], ""), name) \
+                return tuple([optfloat(atts.get(reverse_header_dict[name], ""), name)
                               for name in sortOrder])
 
-            attributes = sorted(table.domain.attributes,
-                                key=sorting_key)
+            attributes = sorted(table.domain.attributes, key=sorting_key)
 
-            domain = orange.Domain(attributes, table.domain.classVar)
-            domain.addmetas(table.domain.getmetas())
-            table = orange.ExampleTable(domain, table)
+            domain = Orange.data.Domain(
+                attributes, table.domain.class_vars, table.domain.metas)
 
-            from Orange.orng.orngDataCaching import data_hints
+            table = Orange.data.Table.from_table(domain, table)
+            table = Orange.data.Table(domain, table)
+
+            if self.transpose:
+                experiments = [at for at in table.domain.variables]
+                attr = [compat.ContinuousVariable.make(ex['DDB'].value) for ex in table]
+                metavars = sorted(table.domain.variables[0].attributes.keys())
+                metavars = [compat.StringVariable.make(name) for name in metavars]
+                domain = compat.create_domain(attr, None, metavars)
+                metas = [[exp.attributes[var.name] for var in metavars] for exp in experiments]
+                table = compat.create_table(domain, table.X.transpose(), None, metas)
+
             data_hints.set_hint(table, "taxid", "352472")
             data_hints.set_hint(table, "genesinrows", False)
 
-            self.send("Example table", table)
+            self.send("Data", table)
 
             self.UpdateCached()
 
@@ -879,10 +875,16 @@ class OWGenExpress(OWWidget):
             hview.setSectionHidden(i, state.get(label, True))
             self.experimentsWidget.resizeColumnToContents(i)
 
-if __name__ == "__main__":
+
+def test_main():
+    from AnyQt.QtWidgets import QApplication
     app = QApplication(sys.argv)
-    obiDicty.verbose = True
+    dicty.verbose = True
     w = OWGenExpress()
     w.show()
-    app.exec_()
+    r = app.exec_()
     w.saveSettings()
+    return r
+
+if __name__ == "__main__":
+    sys.exit(test_main())

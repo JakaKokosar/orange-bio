@@ -11,8 +11,8 @@ from Orange.data import Table
 from Orange.widgets.widget import OWWidget
 from Orange.widgets import gui, settings
 from orangecontrib.bio import resolwe
-from .. import dicty
-from ..utils import environ
+from orangecontrib.bio import dicty
+from orangecontrib.bio.utils import environ
 
 CallBack = dicty.CallBack
 Labels = [

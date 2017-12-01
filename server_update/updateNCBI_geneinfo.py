@@ -1,6 +1,7 @@
 from server_update import *
 from server_update.tests.test_NCBIGeneInfo import NCBIGeneInfoTest
-from orangecontrib.bio import obiGene, obiTaxonomy
+from orangecontrib.bio import gene, taxonomy
+
 
 
 DOMAIN = 'NCBI_geneinfo'
@@ -11,13 +12,13 @@ gene_info_filename = os.path.join(domain_path, "gene_info")
 gene_history_filename = os.path.join(domain_path, "gene_history")
 
 
-taxids = obiGene.NCBIGeneInfo.common_taxids()
-essential = obiGene.NCBIGeneInfo.essential_taxids()
+taxids = gene.NCBIGeneInfo.common_taxids()
+essential = gene.NCBIGeneInfo.essential_taxids()
 genes = dict([(taxid, []) for taxid in taxids])
 history = dict([(taxid, []) for taxid in taxids])
 
 print("Downloading geneinfo file...")
-obiGene.NCBIGeneInfo.get_geneinfo_from_ncbi(gene_info_filename)
+gene.NCBIGeneInfo.get_geneinfo_from_ncbi(gene_info_filename)
 with open(gene_info_filename, 'r') as gene_info_temp:
     print("creating genes info dict...")
     for gi in gene_info_temp:
@@ -26,7 +27,7 @@ with open(gene_info_filename, 'r') as gene_info_temp:
 
 
 print("Downloading gene history file...")
-obiGene.NCBIGeneInfo.get_gene_history_from_ncbi(gene_history_filename)
+gene.NCBIGeneInfo.get_gene_history_from_ncbi(gene_history_filename)
 with open(gene_history_filename, 'r') as gene_history_temp:
     print("creating genes history dict...")
     for hi in gene_history_temp:
@@ -37,7 +38,7 @@ print("Done!")
 
 
 for taxid, genes in genes.items():
-    TAGS_ORGANISM = [obiTaxonomy.name(taxid)] + obiTaxonomy.shortname(taxid) + \
+    TAGS_ORGANISM = [taxonomy.name(taxid)] + taxonomy.shortname(taxid) + \
                     (["essential"] if taxid in essential else [])
 
     TAGS_INFO = ["NCBI", "gene info", "gene_names"] + TAGS_ORGANISM
@@ -49,7 +50,7 @@ for taxid, genes in genes.items():
         f.flush()
         f.close()
         print("{} created".format(filename))
-        create_info_file(filename, title="NCBI gene info for %s" % obiTaxonomy.name(taxid), tags=TAGS_INFO)
+        create_info_file(filename, title="NCBI gene info for %s" % taxonomy.name(taxid), tags=TAGS_INFO)
         print("{}.info file created".format(filename))
 
     filename = os.path.join(domain_path, "gene_history.%s.db" % taxid)
@@ -58,7 +59,7 @@ for taxid, genes in genes.items():
         f.flush()
         f.close()
         print("{} created".format(filename))
-        create_info_file(filename, title="NCBI gene history for %s" % obiTaxonomy.name(taxid), tags=TAGS_HIST)
+        create_info_file(filename, title="NCBI gene history for %s" % taxonomy.name(taxid), tags=TAGS_HIST)
         print("{}.info file created".format(filename))
 
 helper = SyncHelper(DOMAIN, NCBIGeneInfoTest)

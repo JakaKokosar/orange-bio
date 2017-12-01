@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 import os
 import errno
 import sys
@@ -7,6 +5,7 @@ import shelve
 import itertools
 import warnings
 import io
+import six
 
 from functools import wraps, reduce
 from collections import namedtuple
@@ -14,24 +13,13 @@ from operator import itemgetter
 from contextlib import closing
 from xml.dom import pulldom
 
+from urllib.request import urlopen
+from urllib.response import addinfourl
+from urllib.parse import quote
+from urllib.error import HTTPError
+import dbm as anydbm
 
-if sys.version_info < (3,):
-    from urllib2 import HTTPError, urlopen, quote
-    from urllib import addinfourl
-    import anydbm
-else:
-    from urllib.request import urlopen
-    from urllib.response import addinfourl
-    from urllib.parse import quote
-    from urllib.error import HTTPError
-    import dbm as anydbm
-
-import six
-
-try:
-    from Orange.utils import environ
-except ImportError:
-    from .utils import environ
+from .utils import environ
 
 
 class BioMartError(Exception):

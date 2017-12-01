@@ -1,28 +1,13 @@
-from __future__ import absolute_import
-
 import os
 import gzip
 import re
 import io
-
-from collections import defaultdict
-
-import six
-if six.PY3:
-    import pickle
-else:
-    import cPickle as pickle
-
+import urllib.request
+import pickle
 import numpy
 
-import Orange.data
-if six.PY3:
-    from Orange.data import DiscreteVariable, ContinuousVariable, StringVariable
-else:
-    from Orange.feature import Discrete as DiscreteVariable
-    from Orange.feature import Continuous as ContinuousVariable
-    from Orange.feature import String as StringVariable
-
+from collections import defaultdict
+from Orange.data import DiscreteVariable, ContinuousVariable, StringVariable, Domain, Table
 from .utils import serverfiles
 from .utils import compat
 from . import taxonomy
@@ -94,19 +79,24 @@ class GDSInfo:
         if not os.path.exists(path) or force_update:
             serverfiles.download(DOMAIN, GDS_INFO_FILENAME)
         f = open(path, "rb")
-        if six.PY3:
-            self.info, self.excluded = pickle.load(f,  encoding='latin1')
-        else:
-            self.info, self.excluded = pickle.load(f)
+        self.info, self.excluded = pickle.load(f,  encoding='latin1')
 
     def keys(self): return self.info.keys()
+
     def items(self): return self.info.items()
+
     def values(self): return self.info.values()
+
     def clear(self): return self.info.clear()
+
     def __getitem__(self, key): return self.info[key]
+
     def __setitem__(self, key, item): self.info[key] = item
+
     def __len__(self): return len(self.info)
+
     def __iter__(self): return iter(self.info)
+
     def __contains__(self, key): return key in self.info
     
 
@@ -117,7 +107,8 @@ class GeneData:
         self.gene_name = gene_name
         self.data = d
 
-class GDS():
+
+class GDS:
     """ 
     Retrieval of a specific GEO DataSet as a :obj:`Orange.data.Table`.
 
@@ -159,17 +150,13 @@ class GDS():
             base_url = ("ftp://{FTP_NCBI}/{FTP_DIR}"
                         .format(FTP_NCBI=FTP_NCBI, FTP_DIR=FTP_DIR))
             url = base_url + self.gdsname + ".soft.gz"
-            if six.PY2:
-                Orange.utils.wget(url, localpath, progress=self.verbose)
-            else:
-                targetfn = os.path.join(localpath, self.gdsname + ".soft.gz")
-                import urllib.request
-                r = urllib.request.urlopen(url)
-                with open(targetfn + "2", 'wb') as f:
-                     f.write(r.read())
-                with gzip.open(targetfn + "2") as f:
-                    f.read() #verify the download
-                os.rename(targetfn + "2", targetfn)
+            targetfn = os.path.join(localpath, self.gdsname + ".soft.gz")
+            r = urllib.request.urlopen(url)
+            with open(targetfn + "2", 'wb') as f:
+                 f.write(r.read())
+            with gzip.open(targetfn + "2") as f:
+                f.read() #verify the download
+            os.rename(targetfn + "2", targetfn)
 
     def _getinfo(self):
         """Parse GDS data file and return a dictionary with info."""
@@ -177,8 +164,7 @@ class GDS():
         getid = lambda x: x.rstrip().split(" ")[2]
         self._download()
         f = gzip.open(self.filename, "rb")
-        if six.PY3:
-            f = io.TextIOWrapper(f, encoding=SOFT_ENCODING)
+        f = io.TextIOWrapper(f, encoding=SOFT_ENCODING)
 
         state = None; previous_state = None
     
@@ -227,8 +213,7 @@ class GDS():
     def _getspotmap(self, include_spots=None):
         """Return gene to spot and spot to genes mapings."""
         f = gzip.open(self.filename, "rb")
-        if six.PY3:
-            f = io.TextIOWrapper(f, encoding=SOFT_ENCODING)
+        f = io.TextIOWrapper(f, encoding=SOFT_ENCODING)
         for line in f:
             if line.startswith("!dataset_table_begin"):
                 break
@@ -270,8 +255,7 @@ class GDS():
     def _parse_soft(self, remove_unknown=None):
         """Parse GDS data, returns data dictionary."""
         f = gzip.open(self.filename, "rb")
-        if six.PY3:
-            f = io.TextIOWrapper(f, encoding=SOFT_ENCODING)
+        f = io.TextIOWrapper(f, encoding=SOFT_ENCODING)
 
         mfloat = lambda x: float(x) if x != 'null' else compat.unknown
     
@@ -411,6 +395,7 @@ def _float_or_na(x):
     else:
         return float(x)
 
+
 def transpose_class_to_labels(data, attcol="sample"):
     """Converts data with genes as attributes to data with genes in rows."""
     if attcol in [v.name for v in data.domain.getmetas().values()]:
@@ -419,7 +404,7 @@ def transpose_class_to_labels(data, attcol="sample"):
         atts = [ContinuousVariable("S%d" % i) for i in range(len(data))]
     for i, d in enumerate(data):
         atts[i].setattr("class", str(d.getclass()))
-    domain = Orange.data.Domain(atts, None)
+    domain = Domain(atts, None)
     
     newdata = []
     for a in data.domain.attributes:
@@ -427,12 +412,13 @@ def transpose_class_to_labels(data, attcol="sample"):
 
     gene = StringVariable("gene")
     id = StringVariable.new_meta_id()
-    new = Orange.data.Table(domain, newdata)
+    new = Table(domain, newdata)
     new.domain.addmeta(id, gene)
     for i, d in enumerate(new):
         d[gene] = data.domain.attributes[i].name
 
     return new
+
 
 def transpose_labels_to_class(data, class_label=None, gene_label="gene"):
     """Converts data with genes in rows to data with genes as attributes."""
@@ -460,7 +446,7 @@ def transpose_labels_to_class(data, class_label=None, gene_label="gene"):
     else:
         classvar = DiscreteVariable(class_label, values=classvalues)
         
-    domain = Orange.data.Domain(atts, classvar)
+    domain = Domain(atts, classvar)
     
     newdata = []
     for a in data.domain.attributes:
@@ -468,12 +454,13 @@ def transpose_labels_to_class(data, class_label=None, gene_label="gene"):
 
     sample = StringVariable("sample")
     id = StringVariable.new_meta_id()
-    new = Orange.data.Table(domain, newdata)
+    new = Table(domain, newdata)
     new.domain.addmeta(id, sample)
     for i, d in enumerate(new):
         d[sample] = data.domain.attributes[i].name
 
     return new
+
 
 def transpose(data):
     """ Transposes data matrix, converts class information to attribute label and back. """

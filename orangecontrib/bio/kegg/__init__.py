@@ -47,15 +47,11 @@ ENTRY       672               CDS       T01001
 NAME        BRCA1, BRCAI, BRCC1, BROVCA1, FANCS, IRIS, PNCA4, PPP1R53, PSCP, RNF53
 DEFINITION  ...
 """
-from __future__ import absolute_import
 
-import os
-import sys
 import threading
 
 from collections import defaultdict
 from itertools import chain
-from datetime import datetime
 from contextlib import contextmanager
 
 from orangecontrib.bio import utils, taxonomy
@@ -64,7 +60,6 @@ from orangecontrib.bio.kegg import databases
 from orangecontrib.bio.kegg import entry
 
 from orangecontrib.bio.kegg.brite import BriteEntry, Brite
-
 from orangecontrib.bio.kegg import api
 from orangecontrib.bio.kegg import conf
 from orangecontrib.bio.kegg import pathway
@@ -309,15 +304,15 @@ class Organism(object):
 
     def _get_genematcher(self):
         if getattr(self, "_genematcher", None) is None:
-            from .. import obiGene
+            from orangecontrib.bio import gene
             if self.org_code == "ddi":
-                self._genematcher = obiGene.matcher(
-                    [obiGene.GMKEGG(self.org_code), obiGene.GMDicty(),
-                     [obiGene.GMKEGG(self.org_code), obiGene.GMDicty()]]
+                self._genematcher = gene.matcher(
+                    [gene.GMKEGG(self.org_code), gene.GMDicty(),
+                     [gene.GMKEGG(self.org_code), gene.GMDicty()]]
                 )
             else:
-                self._genematcher = obiGene.matcher(
-                    [obiGene.GMKEGG(self.org_code)])
+                self._genematcher = gene.matcher(
+                    [gene.GMKEGG(self.org_code)])
 
             self._genematcher.set_targets(self.genes.keys())
         return self._genematcher

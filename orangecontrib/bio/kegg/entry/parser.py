@@ -2,9 +2,7 @@
 A parser for DBGET database entries
 
 """
-from __future__ import print_function
-
-from six import StringIO
+from io import StringIO
 
 
 class DBGETEntryParser(object):

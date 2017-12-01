@@ -1,31 +1,58 @@
-"""<name>GEO Data Sets</name>
-<description>Access to Gene Expression Omnibus data sets.</description>
-<priority>20</priority>
-<contact>Ales Erjavec (ales.erjavec(@at@)fri.uni-lj.si)</contact>
-<icon>icons/GEODataSets.svg</icon>
-"""
-
-from __future__ import absolute_import, with_statement
-
-import sys
-import os
 import glob
-import string
-import urllib2
+import io
+import os
+import sys
+import tempfile
 from collections import defaultdict
 from functools import partial
 
-from Orange.utils import lru_cache
-from orangecontrib.bio.utils import serverfiles
-from Orange.orng.orngDataCaching import data_hints
-from Orange.OrangeWidgets import OWGUI, OWGUIEx
-from Orange.OrangeWidgets.OWWidget import *
+if sys.version_info < (3, ):
+    import urllib2 as urlrequest
+    from Orange.utils import lru_cache
+    str = unicode
+else:
+    import urllib.request as urlrequest
+    from functools import lru_cache
+    unicode = str
 
-from Orange.OrangeWidgets.OWConcurrent import (
-    ThreadExecutor, Task, methodinvoke
+import numpy
+
+from AnyQt.QtWidgets import (
+    QLineEdit, QSplitter, QTreeView, QTreeWidget, QTreeWidgetItem,
+)
+from AnyQt.QtGui import QStandardItemModel, QStandardItem
+from AnyQt.QtCore import (
+    Qt, QThread, QCoreApplication, QSortFilterProxyModel, QItemSelectionModel,
+    Slot
 )
 
-from .. import geo
+import Orange.data
+
+if sys.version_info < (3, ):
+    from Orange.OrangeWidgets.OWWidget import OWWidget
+    from Orange.OrangeWidgets import OWGUI as gui
+    from Orange.OrangeWidgets.OWGUI import LinkStyledItemDelegate, LinkRole
+    Setting = lambda val: val
+    from Orange.OrangeWidgets.OWConcurrent import (
+        ThreadExecutor, Task, methodinvoke
+    )
+    from Orange.orng.orngDataCaching import data_hints
+    qunpack = lambda qvar: qvar.toPyObject()
+else:
+    from Orange.widgets.widget import OWWidget
+    from Orange.widgets import gui
+    from Orange.widgets.gui import LinkStyledItemDelegate, LinkRole
+    from Orange.widgets.settings import Setting
+    from Orange.widgets.utils.concurrent import (
+        ThreadExecutor, Task, methodinvoke
+    )
+    from Orange.widgets.utils.datacaching import data_hints
+    unicode = str
+    qunpack = lambda obj: obj
+
+from orangecontrib.bio.utils import serverfiles
+from orangecontrib.bio import geo
+from orangecontrib.bio.widgets.utils.gui import TokenListCompleter
 
 NAME = "GEO Data Sets"
 DESCRIPTION = "Access to Gene Expression Omnibus data sets."
@@ -38,7 +65,7 @@ OUTPUTS = [("Expression Data", Orange.data.Table)]
 REPLACES = ["_bioinformatics.widgets.OWGEODatasets.OWGEODatasets"]
 
 
-TextFilterRole = OWGUI.OrangeUserRole.next()
+TextFilterRole = next(gui.OrangeUserRole)
 
 
 class MySortFilterProxyModel(QSortFilterProxyModel):
@@ -129,11 +156,9 @@ class MySortFilterProxyModel(QSortFilterProxyModel):
         f_column = self.filterKeyColumn()
         s_model = self.sourceModel()
         data = s_model.data(s_model.index(row, f_column), f_role)
-        if isinstance(data, QVariant):
-            data = unicode(data.toString(), errors="ignore")
-        else:
-            data = unicode(data, errors="ignore")
-        return data
+#         data = qunpack(data)
+        data = unicode(data)
+        return str(data)
 
     def filterAcceptsRow(self, row, parent):
         return self._cache_fixed.get(row, True)
@@ -141,8 +166,8 @@ class MySortFilterProxyModel(QSortFilterProxyModel):
     def lessThan(self, left, right):
         # TODO: Remove fixed column handling
         if left.column() == 1 and right.column():
-            left_gds = str(left.data(Qt.DisplayRole).toString())
-            right_gds = str(right.data(Qt.DisplayRole).toString())
+            left_gds = str(qunpack(left.data(Qt.DisplayRole)))
+            right_gds = str(qunpack(right.data(Qt.DisplayRole)))
             left_gds = left_gds.lstrip("GDS")
             right_gds = right_gds.lstrip("GDS")
             try:
@@ -150,8 +175,6 @@ class MySortFilterProxyModel(QSortFilterProxyModel):
             except ValueError:
                 pass
         return QSortFilterProxyModel.lessThan(self, left, right)
-
-from Orange.OrangeWidgets.OWGUI import LinkStyledItemDelegate, LinkRole
 
 
 def childiter(item):
@@ -162,75 +185,87 @@ def childiter(item):
 
 
 class OWGEODatasets(OWWidget):
+    name = "GEO Data Sets"
+    description = DESCRIPTION
+    icon = "../widgets/icons/GEODataSets.svg"
+    priority = PRIORITY
+
+    inputs = []
+    outputs = [("Expression Data", Orange.data.Table)]
+
     settingsList = ["outputRows", "mergeSpots", "gdsSelectionStates",
                     "splitterSettings", "currentGds", "autoCommit",
                     "datasetNames"]
 
+    outputRows = Setting(True)
+    mergeSpots = Setting(True)
+    gdsSelectionStates = Setting({})
+    currentGds = Setting(None)
+    datasetNames = Setting({})
+    splitterSettings = Setting(
+        (b'\x00\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x01\xea\x00\x00\x00\xd7\x01\x00\x00\x00\x07\x01\x00\x00\x00\x02',
+         b'\x00\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x01\xb5\x00\x00\x02\x10\x01\x00\x00\x00\x07\x01\x00\x00\x00\x01')
+    )
+
+    autoCommit = Setting(False)
+
     def __init__(self, parent=None, signalManager=None, name=" GEO Data Sets"):
         OWWidget.__init__(self, parent, signalManager, name)
 
-        self.outputs = [("Expression Data", ExampleTable)]
-
-        ## Settings
-        self.selectedAnnotation = 0
-        self.includeIf = False
-        self.minSamples = 3
-        self.autoCommit = False
-        self.outputRows = 1
-        self.mergeSpots = True
-        self.filterString = ""
-        self.currentGds = None
         self.selectionChanged = False
-        self.autoCommit = False
-        self.gdsSelectionStates = {}
-        self.splitterSettings = [
-            '\x00\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x01\xea\x00\x00\x00\xd7\x01\x00\x00\x00\x07\x01\x00\x00\x00\x02',
-            '\x00\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x01\xb5\x00\x00\x02\x10\x01\x00\x00\x00\x07\x01\x00\x00\x00\x01'
-        ]
-        self.datasetNames = {}
-        self.loadSettings()
-
+        self.filterString = ""
         self.datasetName = ""
 
         ## GUI
-        self.infoBox = OWGUI.widgetLabel(
-            OWGUI.widgetBox(self.controlArea, "Info", addSpace=True),
-            "Initializing\n\n"
-        )
+        box = gui.widgetBox(self.controlArea, "Info", addSpace=True)
+        self.infoBox = gui.widgetLabel(box, "Initializing\n\n")
 
-        box = OWGUI.widgetBox(self.controlArea, "Output", addSpace=True)
-        OWGUI.radioButtonsInBox(box, self, "outputRows",
-                                ["Genes in rows", "Samples in rows"], "Rows",
-                                callback=self.commitIf)
-        OWGUI.checkBox(box, self, "mergeSpots", "Merge spots of same gene",
-                       callback=self.commitIf)
+        box = gui.widgetBox(self.controlArea, "Output", addSpace=True)
+        gui.radioButtonsInBox(box, self, "outputRows",
+                              ["Genes in rows", "Samples in rows"], "Rows",
+                              callback=self.commitIf)
 
-        OWGUI.separator(box)
-        self.nameEdit = OWGUI.lineEdit(
+        gui.checkBox(box, self, "mergeSpots", "Merge spots of same gene",
+                     callback=self.commitIf)
+
+        gui.separator(box)
+        self.nameEdit = gui.lineEdit(
             box, self, "datasetName", "Data set name",
             tooltip="Override the default output data set name",
             callback=self.onNameEdited
         )
         self.nameEdit.setPlaceholderText("")
 
-        box = OWGUI.widgetBox(self.controlArea, "Commit", addSpace=True)
-        self.commitButton = OWGUI.button(box, self, "Commit",
-                                         callback=self.commit)
-        cb = OWGUI.checkBox(box, self, "autoCommit", "Commit on any change")
-        OWGUI.setStopper(self, self.commitButton, cb, "selectionChanged",
-                         self.commit)
-        OWGUI.rubber(self.controlArea)
+        if sys.version_info < (3, ):
+            box = gui.widgetBox(self.controlArea, "Commit", addSpace=True)
+            self.commitButton = gui.button(
+                box, self, "Commit", callback=self.commit)
+            cb = gui.checkBox(box, self, "autoCommit", "Commit on any change")
+            gui.setStopper(self, self.commitButton, cb, "selectionChanged",
+                           self.commit)
+        else:
+            gui.auto_commit(self.controlArea, self, "autoCommit", "Commit",
+                            box="Commit")
+            self.commitIf = self.commit
 
-        self.filterLineEdit = OWGUIEx.lineEditHint(
-            self.mainArea, self, "filterString", "Filter",
-            caseSensitive=False, matchAnywhere=True,
-            callback=self.filter,  delimiters=" ")
+        gui.rubber(self.controlArea)
+
+        gui.widgetLabel(self.mainArea, "Filter")
+        self.filterLineEdit = QLineEdit(
+            textChanged=self.filter
+        )
+        self.completer = TokenListCompleter(
+            self, caseSensitivity=Qt.CaseInsensitive
+        )
+        self.filterLineEdit.setCompleter(self.completer)
+
+        self.mainArea.layout().addWidget(self.filterLineEdit)
 
         splitter = QSplitter(Qt.Vertical, self.mainArea)
         self.mainArea.layout().addWidget(splitter)
         self.treeWidget = QTreeView(splitter)
 
-        self.treeWidget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.treeWidget.setSelectionMode(QTreeView.SingleSelection)
         self.treeWidget.setRootIsDecorated(False)
         self.treeWidget.setSortingEnabled(True)
         self.treeWidget.setAlternatingRowColors(True)
@@ -241,8 +276,8 @@ class OWGEODatasets(OWWidget):
         self.treeWidget.setItemDelegateForColumn(1, linkdelegate)
         self.treeWidget.setItemDelegateForColumn(8, linkdelegate)
         self.treeWidget.setItemDelegateForColumn(
-            0, OWGUI.IndicatorItemDelegate(self.treeWidget,
-                                           role=Qt.DisplayRole))
+            0, gui.IndicatorItemDelegate(self.treeWidget,
+                                         role=Qt.DisplayRole))
 
         proxyModel = MySortFilterProxyModel(self.treeWidget)
         self.treeWidget.setModel(proxyModel)
@@ -253,12 +288,12 @@ class OWGEODatasets(OWWidget):
 
         splitterH = QSplitter(Qt.Horizontal, splitter)
 
-        box = OWGUI.widgetBox(splitterH, "Description")
-        self.infoGDS = OWGUI.widgetLabel(box, "")
+        box = gui.widgetBox(splitterH, "Description")
+        self.infoGDS = gui.widgetLabel(box, "")
         self.infoGDS.setWordWrap(True)
-        OWGUI.rubber(box)
+        gui.rubber(box)
 
-        box = OWGUI.widgetBox(splitterH, "Sample Annotations")
+        box = gui.widgetBox(splitterH, "Sample Annotations")
         self.annotationsTree = QTreeWidget(box)
         self.annotationsTree.setHeaderLabels(
             ["Type (Sample annotations)", "Sample count"]
@@ -297,7 +332,7 @@ class OWGEODatasets(OWWidget):
 
         self._datatask = None
 
-    @pyqtSlot(float)
+    @Slot(float)
     def _setProgress(self, value):
         self.progressBarValue = value
 
@@ -323,27 +358,27 @@ class OWGEODatasets(OWWidget):
             gds[key] for gds in self.gds for key in self.searchKeys
         )
         tr_chars = ",.:;!?(){}[]_-+\\|/%#@$^&*<>~`"
-        tr_table = string.maketrans(tr_chars, " " * len(tr_chars))
+        tr_table = str.maketrans(tr_chars, " " * len(tr_chars))
         filter_items = filter_items.translate(tr_table)
 
         filter_items = sorted(set(filter_items.split(" ")))
         filter_items = [item for item in filter_items if len(item) > 3]
-        self.filterLineEdit.setItems(filter_items)
+
+        self.completer.setTokenList(filter_items)
 
         if self.currentGds:
-            gdss = [(i, proxy.data(proxy.index(i, 1), Qt.DisplayRole))
+            current_id = self.currentGds["dataset_id"]
+            gdss = [(i, qunpack(proxy.data(proxy.index(i, 1), Qt.DisplayRole)))
                     for i in range(proxy.rowCount())]
-            current = [i for i, variant in gdss
-                       if variant.isValid() and
-                       str(variant.toString()) == self.currentGds["dataset_id"]]
+            current = [i for i, data in gdss if data and data == current_id]
             if current:
                 current_index = proxy.index(current[0], 0)
                 self.treeWidget.selectionModel().select(
                     current_index,
-                    QItemSelectionModel.Select |
-                    QItemSelectionModel.Rows
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows
                 )
-                self.treeWidget.scrollTo(current_index)
+                self.treeWidget.scrollTo(
+                    current_index, QTreeView.PositionAtCenter)
 
         for i in range(8):
             self.treeWidget.resizeColumnToContents(i)
@@ -428,7 +463,7 @@ class OWGEODatasets(OWWidget):
                 self.gdsSelectionStates[child.key] = child.checkState(0)
 
     def filter(self):
-        filter_string = unicode(self.filterLineEdit.text(), errors="ignore")
+        filter_string = unicode(self.filterLineEdit.text())
         proxyModel = self.treeWidget.model()
         if proxyModel:
             strings = filter_string.lower().strip().split()
@@ -474,12 +509,19 @@ class OWGEODatasets(OWWidget):
         else:
             self.selectionChanged = True
 
+    @Slot(int, int)
+    def progressCompleted(self, value, total):
+        if total > 0:
+            self.progressBarSet(100. * value / total, processEvents=False)
+        else:
+            pass
+            # TODO: report 'indeterminate progress'
+
     def commit(self):
         if self.currentGds:
             self.error(0)
             sample_type = None
-            self.progressBarInit()
-            self.progressBarSet(10)
+            self.progressBarInit(processEvents=None)
 
             _, groups = self.selectedSamples()
             if len(groups) == 1 and self.outputRows:
@@ -488,7 +530,10 @@ class OWGEODatasets(OWWidget):
             self.setEnabled(False)
             self.setBlocking(True)
 
+            progress = methodinvoke(self, "progressCompleted", (int, int))
+
             def get_data(gds_id, report_genes, transpose, sample_type, title):
+                gds_ensure_downloaded(gds_id, progress)
                 gds = geo.GDS(gds_id)
                 data = gds.getdata(
                     report_genes=report_genes, transpose=transpose,
@@ -511,19 +556,17 @@ class OWGEODatasets(OWWidget):
     def _on_dataready(self):
         self.setEnabled(True)
         self.setBlocking(False)
-
-        self.progressBarSet(50)
+        self.progressBarFinished(processEvents=False)
 
         try:
             data = self._datatask.result()
-        except urllib2.URLError as error:
-            self.error(0, "Error while connecting to the NCBI ftp server! %r" %
-                       error)
-            self._datatask = None
-            self.progressBarFinished()
+        except urlrequest.URLError as error:
+            self.error(0, ("Error while connecting to the NCBI ftp server! "
+                           "'%s'" % error))
+            sys.excepthook(type(error), error, getattr(error, "__traceback__"))
             return
-
-        self._datatask = None
+        finally:
+            self._datatask = None
 
         data_name = data.name
         samples, _ = self.selectedSamples()
@@ -533,26 +576,29 @@ class OWGEODatasets(OWWidget):
         if self.outputRows:
             def samplesinst(ex):
                 out = []
-                for i, a in data.domain.get_metas().items():
-                    out.append((a.name, ex[i].value))
+                for meta in data.domain.metas:
+                    out.append((meta.name, ex[meta].value))
+
                 if data.domain.class_var.name != 'class':
-                    out.append((data.domain.class_var.name, ex[-1].value))
+                    out.append((data.domain.class_var.name,
+                                ex[data.domain.class_var].value))
+
                 return out
             samples = set(samples)
-
-            select = [1 if samples.issuperset(samplesinst(ex)) else 0
-                      for ex in data]
-            data = data.select(select)
+            mask = [samples.issuperset(samplesinst(ex)) for ex in data]
+            data = data[numpy.array(mask, dtype=bool)]
             if len(data) == 0:
                 message = "No samples with selected sample annotations."
         else:
             samples = set(samples)
-            domain = orange.Domain(
+            domain = Orange.data.Domain(
                 [attr for attr in data.domain.attributes
                  if samples.issuperset(attr.attributes.items())],
-                data.domain.classVar
+                data.domain.class_var,
+                data.domain.metas
             )
-            domain.addmetas(data.domain.getmetas())
+#             domain.addmetas(data.domain.getmetas())
+
             if len(domain.attributes) == 0:
                 message = "No samples with selected sample annotations."
             stypes = set(s[0] for s in samples)
@@ -561,7 +607,7 @@ class OWGEODatasets(OWWidget):
                     (key, value) for key, value in attr.attributes.items()
                     if key in stypes
                 )
-            data = orange.ExampleTable(domain, data)
+            data = Orange.data.Table(domain, data)
 
         if message is not None:
             self.warning(0, message)
@@ -570,20 +616,37 @@ class OWGEODatasets(OWWidget):
                             10.0)
         data_hints.set_hint(data, "genesinrows", self.outputRows, 10.0)
 
-        self.progressBarFinished()
         data.name = data_name
         self.send("Expression Data", data)
 
         model = self.treeWidget.model().sourceModel()
         row = self.gds.index(self.currentGds)
 
-        model.setData(model.index(row, 0),  QVariant(" "), Qt.DisplayRole)
+        model.setData(model.index(row, 0),  " ", Qt.DisplayRole)
 
         self.updateInfo()
         self.selectionChanged = False
 
     def splitterMoved(self, *args):
-        self.splitterSettings = [str(sp.saveState()) for sp in self.splitters]
+        self.splitterSettings = [bytes(sp.saveState()) for sp in self.splitters]
+
+    def send_report(self):
+        self.report_items("GEO Dataset",
+                          [("ID", self.currentGds['dataset_id']), ("Title", self.currentGds['title']),
+                           ("Organism", self.currentGds['sample_organism'])])
+        self.report_items("Data", [("Samples", self.currentGds['sample_count']),
+                                   ("Features", self.currentGds['feature_count']),
+                                   ("Genes", self.currentGds['gene_count'])])
+        self.report_name("Sample annotations")
+        subsets = defaultdict(list)
+        for subset in self.currentGds['subsets']:
+            subsets[subset['type']].append((subset['description'], len(subset['sample_id'])))
+        self.report_html += "<ul>"
+        for type in subsets:
+            self.report_html += "<b>" + type + ":</b></br>"
+            for desc, count in subsets[type]:
+                self.report_html += 9 * "&nbsp" + "<b>{}:</b> {}</br>".format(desc, count)
+        self.report_html += "</ul>"
 
     def onDeleteWidget(self):
         if self._inittask:
@@ -601,6 +664,7 @@ class OWGEODatasets(OWWidget):
             gds_id = self.currentGds["dataset_id"]
             self.datasetNames[gds_id] = unicode(self.nameEdit.text())
             self.commitIf()
+
 
 def get_gds_model(progress=lambda val: None):
     """
@@ -630,17 +694,14 @@ def get_gds_model(progress=lambda val: None):
     def item(displayvalue, item_values={}):
         item = QStandardItem()
         item.setData(displayvalue, Qt.DisplayRole)
-        for role, value in item_values.iteritems():
+        for role, value in item_values.items():
             item.setData(value, role)
         return item
 
     def gds_to_row(gds):
         #: Text for easier full search.
-        search_text = unicode(
-            " | ".join([gds.get(key, "").lower()
-                        for key in search_keys]),
-            errors="ignore"
-        )
+        search_text = " | ".join([gds.get(key, "").lower()
+                                  for key in search_keys])
         row = [
             item(" " if is_cached(gds) else "",
                  {TextFilterRole: search_text}),
@@ -655,7 +716,7 @@ def get_gds_model(progress=lambda val: None):
             item(gds.get("pubmed_id", ""),
                  {LinkRole: pm_link.format(gds["pubmed_id"])
                             if gds.get("pubmed_id")
-                            else QVariant()})
+                            else None})
         ]
         return row
 
@@ -677,9 +738,143 @@ def get_gds_model(progress=lambda val: None):
     return model, info, gds_list
 
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
+GDS_CACHE_DIR = serverfiles.localpath(geo.DOMAIN)
+
+
+if sys.version_info >= (3, 4):
+    _os_replace = os.replace
+else:
+    if os.name != "posix":
+        def _os_replace(src, dst):
+            try:
+                os.rename(src, dst)
+            except FileExistsError:
+                os.remove(dst)
+                os.rename(src)
+    else:
+        _os_replace = os.rename
+
+
+def gds_is_cached(gdsname):
+    return os.path.isfile(
+        os.path.join(GDS_CACHE_DIR, gdsname + ".soft.gz"))
+
+
+def gds_ensure_downloaded(gdsname, progress=None):
+    """
+    Ensure the GDS dataset is available locally in GDS_CACHE_DIR.
+    """
+    if gds_is_cached(gdsname):
+        return
+    else:
+        gds_download(gdsname, progress=progress)
+
+
+def gds_download(gdsname, progress=None):
+    """
+    Download the GDS dataset into the GDS_CACHE_DIR.
+    """
+    gdsurl = gds_download_url(gdsname)
+    basename = gdsname + ".soft.gz"
+    targetpath = os.path.join(GDS_CACHE_DIR, basename)
+    temp = tempfile.NamedTemporaryFile(
+       prefix=basename + "-", dir=GDS_CACHE_DIR, delete=False)
+    try:
+        retrieve_url(gdsurl, temp, progress=progress)
+    except BaseException as err:
+        try:
+            temp.close()
+            os.remove(temp.name)
+        except (OSError, IOError):
+            pass
+        raise err
+    else:
+        temp.close()
+        _os_replace(temp.name, targetpath)
+
+
+def gds_download_url(gdsname):
+    """Return the download url for a GDS id `gdsname`."""
+    return "ftp://{}/{}/{}.soft.gz".format(geo.FTP_NCBI, geo.FTP_DIR, gdsname)
+
+
+def retrieve_url(url, dstobj, progress=None):
+    """
+    Retrieve an `url` writing it to an open file-like `destobj`.
+
+    Parameters
+    ----------
+    url : str
+        The source url.
+    destobj : file-like object
+        An file-like object opened for writing.
+    progress : (int, int) -> None optional
+        An optional progress callback function. Will be called
+        periodically with `(transfered, total)` bytes count. `total`
+        can be `-1` if the total contents size cannot be
+        determined beforehand.
+    """
+    with urlrequest.urlopen(url, timeout=10) as stream:
+        length = stream.headers.get("content-length", None)
+        if length is not None:
+            length = int(length)
+        copyfileobj(stream, dstobj, size=length, progress=progress)
+
+
+def copyfileobj(src, dst, buffer=2 ** 15, size=None, progress=None):
+    """
+    Like shutil.copyfileobj but with progress reporting.
+
+    Parameters
+    ----------
+    src : file-like object
+        Source file object
+    dst : file-like object
+        Destination file object
+    buffer : buffer size
+        Buffer size
+    size : int optional
+        Total `src` contents size if available.
+    progress : (int, int) -> None
+        An optional progress callback function. Will be called
+        periodically with `(transfered, total)` bytes count. `total`
+        can be `-1` if the total contents size cannot be
+        determined beforehand.
+    """
+    count = 0
+    if size is None:
+        size = sniff_size(src)
+
+    while True:
+        data = src.read(buffer)
+        dst.write(data)
+        count += len(data)
+        if progress is not None:
+            progress(count, size if size is not None else -1)
+        if not data:
+            break
+
+    if size is None and progress is not None:
+        progress(count, count)
+
+    return count
+
+
+def sniff_size(fileobj):
+    if isinstance(fileobj, io.FileIO):
+        return os.fstat(fileobj.fileno()).st_size
+    return None
+
+
+def main_test():
+    from AnyQt.QtWidgets import QApplication
+    app = QApplication([])
     w = OWGEODatasets()
     w.show()
-    app.exec_()
+    w.raise_()
+    r = app.exec_()
     w.saveSettings()
+    return r
+
+if __name__ == "__main__":
+    sys.exit(main_test())

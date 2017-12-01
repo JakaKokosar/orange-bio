@@ -1,21 +1,16 @@
-from __future__ import absolute_import
-
-import sys, os
+import os
 import shutil
 
-try:
-    from urllib2 import urlopen
-except ImportError:
-    from urllib.request import urlopen
-
+from urllib.request import urlopen
 from functools import reduce
-
 from collections import defaultdict
 
 from ..utils import serverfiles
 
+
 class _homolog(object):
     __slots__ = ["group_id", "taxonomy_id", "gene_id", "gene_symbol"]
+
     def __init__(self, homolog_line):
         for attr, val in zip(self.__slots__, homolog_line.split("\t")):
             setattr(self, attr, val)
@@ -39,12 +34,14 @@ class _Homologs(object):
         """
         homologs = dict(self.homologs(gene, taxid))
         return homologs.get(homolotaxid, None)
-    
+
+
 class HomoloGene(_Homologs):
     DEFAULT_DATABASE_PATH = serverfiles.localpath("HomoloGene")
     VERSION = 1
     DOMAIN = "HomoloGene"
     FILENAME = "homologene.data"
+
     def __init__(self, local_database_path=None):
         self.local_database_path = local_database_path if local_database_path else self.DEFAULT_DATABASE_PATH
         self.load()
@@ -94,7 +91,8 @@ class HomoloGene(_Homologs):
     def homolog(self, gene, taxid, homolotaxid):
         homologs = dict(self.homologs(gene, taxid))
         return homologs.get(homolotaxid, None)
-        
+
+
 def _parseOrthoXML(file):
     """ Return (cluster_id, taxid, gene_id) tuples from orthoXML file 
     """
@@ -120,7 +118,8 @@ def _parseOrthoXML(file):
         ids = [ref.attributes.get("id").value for ref in geneRefs]
         orthologs.extend([(group_id, geneIdToTaxid[geneIds[id][0]], geneIds[id][0]) for id in ids])
     return orthologs
-        
+
+
 class InParanoid(object):
     """ InParanoid: Eukaryotic Ortholog Groups
     """
@@ -159,26 +158,31 @@ class InParanoid(object):
         if ortholog_taxid:
             res = [r[1] for r in res]
         return res
-        
+
+
 def all_genes(taxid):
     """ Return a set of all genes for organism taxid.
     """
     return HomoloGene.get_instance().all_genes(taxid)
+
 
 def homologs(genename, taxid):
     """ Return a list of homologs (taxid, genename) for a homolog group of gene (organism taxid).
     """ 
     return HomoloGene.get_instance().homologs(genename, taxid)
 
+
 def homolog(genename, taxid, homolotaxid):
     """ Return a homolog of genename (for taxid) in organism holomotaxid. If the homolog does not exist, return None.
     """
     return HomoloGene.get_instance().homolog(genename, taxid, homolotaxid)
 
+
 def all_genes_inParanoid(taxid):
     """ Return a set of all genes for organism with taxid in the InParanoid database.
     """
     return InParanoid().all_genes(taxid)
+
 
 def orthologs(genename, taxid, ortholog_taxid=None):
     """ Return all InParanoid orthologs of genename from organism with taxid. 

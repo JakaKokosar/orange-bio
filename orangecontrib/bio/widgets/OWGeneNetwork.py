@@ -1,25 +1,22 @@
+import sys
 from collections import namedtuple
 
-from PyQt4.QtCore import QTimer, QThread, pyqtSlot as Slot
+from AnyQt.QtWidgets import QSizePolicy, QLayout
+from AnyQt.QtCore import Slot
 
 import Orange.data
-import Orange.feature
-import Orange.network
-from Orange.orng.orngDataCaching import data_hints
 
-from Orange.OrangeWidgets import OWWidget
-from Orange.OrangeWidgets import OWGUI
-from Orange.OrangeWidgets import OWItemModels
-from Orange.OrangeWidgets.OWConcurrent import ThreadExecutor, Task, methodinvoke
+from Orange.widgets.utils.datacaching import data_hints
+from Orange.widgets import widget, gui, settings
+from Orange.widgets.utils import itemmodels
 
-from .. import ppi, taxonomy, gene
+from Orange.widgets.utils.concurrent import ThreadExecutor, Task, methodinvoke
 
-NAME = "Gene Network"
-DESCRIPTION = "Extract a gene network for a set of genes."
-ICON = "icons/GeneNetwork.svg"
+from orangecontrib import network
 
-INPUTS = [("Data", Orange.data.Table, "set_data")]
-OUTPUTS = [("Network", Orange.network.Graph)]
+from orangecontrib.bio import ppi, taxonomy, gene
+from orangecontrib.bio.utils import serverfiles, compat
+
 
 Source = namedtuple(
     "Source",
@@ -35,29 +32,28 @@ SOURCES = [
 ]
 
 
-class OWGeneNetwork(OWWidget.OWWidget):
-    settingsList = ["taxid", "use_attr_names", "network_source",
-                    "include_neighborhood", "min_score"]
-    contextHandlers = {
-        "": OWWidget.DomainContextHandler(
-            "", ["taxid", "gene_var_index", "use_attr_names"]
-        )
-    }
+class OWGeneNetwork(widget.OWWidget):
+    name = "Gene Network"
+    description = "Extract a gene network for a set of genes."
+    icon = "../widgets/icons/GeneNetwork.svg"
 
-    def __init__(self, parent=None, signalManager=None, title="Gene Network"):
-        super(OWGeneNetwork, self).__init__(
-            parent, signalManager, title, wantMainArea=False,
-            resizingEnabled=False
-        )
+    inputs = [("Data", Orange.data.Table, "set_data")]
+    outputs = [("Network", network.Graph)]
 
-        self.taxid = "9606"
-        self.gene_var_index = -1
-        self.use_attr_names = False
-        self.network_source = 1
-        self.include_neighborhood = True
-        self.autocommit = False
-        self.min_score = 0.9
-        self.loadSettings()
+    settingsHandler = settings.DomainContextHandler()
+
+    taxid = settings.Setting("9606")
+    gene_var_index = settings.ContextSetting(-1)
+    use_attr_names = settings.ContextSetting(False)
+
+    network_source = settings.Setting(1)
+    include_neighborhood = settings.Setting(True)
+    min_score = settings.Setting(0.9)
+
+    want_main_area = False
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
         self.taxids = taxonomy.common_taxids()
         self.current_taxid_index = self.taxids.index(self.taxid)
@@ -67,48 +63,51 @@ class OWGeneNetwork(OWWidget.OWWidget):
         self.nettask = None
         self._invalidated = False
 
-        box = OWGUI.widgetBox(self.controlArea, "Info")
-        self.info = OWGUI.widgetLabel(box, "No data on input\n")
+        box = gui.widgetBox(self.controlArea, "Info")
+        self.info = gui.widgetLabel(box, "No data on input\n")
 
-        box = OWGUI.widgetBox(self.controlArea, "Organism")
-        self.organism_cb = OWGUI.comboBox(
+        box = gui.widgetBox(self.controlArea, "Organism")
+        self.organism_cb = gui.comboBox(
             box, self, "current_taxid_index",
             items=map(taxonomy.name, self.taxids),
             callback=self._update_organism
         )
-        box = OWGUI.widgetBox(self.controlArea, "Genes")
-        self.genes_cb = OWGUI.comboBox(
+        box = gui.widgetBox(self.controlArea, "Genes")
+        self.genes_cb = gui.comboBox(
             box, self, "gene_var_index", callback=self._update_query_genes
         )
-        self.varmodel = OWItemModels.VariableListModel()
+        self.varmodel = itemmodels.VariableListModel()
         self.genes_cb.setModel(self.varmodel)
 
-        OWGUI.checkBox(
+        gui.checkBox(
             box, self, "use_attr_names",
             "Use attribute names",
             callback=self._update_query_genes
         )
 
-        box = OWGUI.widgetBox(self.controlArea, "Network")
-        OWGUI.comboBox(
+        box = gui.widgetBox(self.controlArea, "Network")
+        gui.comboBox(
             box, self, "network_source",
             items=[s.name for s in SOURCES],
             callback=self._on_source_db_changed
         )
-        OWGUI.checkBox(
+        gui.checkBox(
             box, self, "include_neighborhood",
             "Include immediate gene neighbors",
             callback=self.invalidate
         )
-        self.score_spin = OWGUI.doubleSpin(
+        self.score_spin = gui.doubleSpin(
             box, self, "min_score", 0.0, 1.0, step=0.001,
             label="Minimal edge score",
             callback=self.invalidate
         )
         self.score_spin.setEnabled(SOURCES[self.network_source].score_filter)
 
-        box = OWGUI.widgetBox(self.controlArea, "Commit")
-        OWGUI.button(box, self, "Commit", callback=self.commit, default=True)
+        box = gui.widgetBox(self.controlArea, "Commit")
+        gui.button(box, self, "Retrieve", callback=self.commit, default=True)
+
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.layout().setSizeConstraint(QLayout.SetFixedSize)
 
         self.executor = ThreadExecutor()
 
@@ -129,7 +128,7 @@ class OWGeneNetwork(OWWidget.OWWidget):
             if not (0 <= self.gene_var_index < len(self.varmodel)):
                 self.gene_var_index = len(self.varmodel) - 1
 
-            self.openContext("", data)
+            self.openContext(data)
             self.invalidate()
             self.commit()
         else:
@@ -158,7 +157,7 @@ class OWGeneNetwork(OWWidget.OWWidget):
         elif self.gene_var_index >= 0:
             var = self.varmodel[self.gene_var_index]
             genes = [str(inst[var]) for inst in self.data
-                     if not inst[var].isSpecial()]
+                     if not compat.isunknown(inst[var])]
             return list(unique(genes))
         else:
             return []
@@ -171,21 +170,13 @@ class OWGeneNetwork(OWWidget.OWWidget):
             self.nettask.future().cancel()
             self.nettask = None
 
-        if self.autocommit:
-            QTimer.singleShot(10, self._maybe_commit)
-
-    @Slot()
-    def _maybe_commit(self):
-        if self._invalidated:
-            self.commit()
-
     @Slot()
     def advance(self):
         self.progressBarValue = (self.progressBarValue + 1) % 100
 
     @Slot(float)
     def set_progress(self, value):
-        self.progressBarValue = value
+        self.progressBarSet(value, processEvents=None)
 
     def commit(self):
         include_neighborhood = self.include_neighborhood
@@ -231,7 +222,7 @@ class OWGeneNetwork(OWWidget.OWWidget):
         self._invalidated = False
         self._update_info()
 
-    @Slot(object)
+    @Slot()
     def _on_result_ready(self,):
         self.progressBarFinished()
         self.setBlocking(False)
@@ -283,8 +274,8 @@ def unique(seq):
 
 
 def string_variables(domain):
-    variables = domain.variables + domain.getmetas().values()
-    return [v for v in variables if isinstance(v, Orange.feature.String)]
+    variables = domain.variables + domain.metas
+    return [v for v in variables if isinstance(v, Orange.data.StringVariable)]
 
 
 def multimap_inverse(multimap):
@@ -292,7 +283,7 @@ def multimap_inverse(multimap):
     Return a multimap inverse relation.
     """
     d = {}
-    for key, values in multimap.iteritems():
+    for key, values in multimap.items():
         for v in values:
             d.setdefault(v, []).append(key)
     return d
@@ -325,8 +316,6 @@ def taxid_map(query, targets):
     else:
         return None
 
-from orangecontrib.bio.utils import serverfiles as sf
-
 
 def fetch_ppidb(ppisource, taxid, progress=None):
     fname = ppisource.sf_filename
@@ -342,7 +331,7 @@ def fetch_ppidb(ppisource, taxid, progress=None):
     else:
         constructor = ppisource.constructor
 
-    sf.localpath_download(
+    serverfiles.localpath_download(
         ppisource.sf_domain, fname, callback=progress, verbose=True
     )
     return constructor()
@@ -350,7 +339,7 @@ def fetch_ppidb(ppisource, taxid, progress=None):
 
 def fetch_ncbi_geneinfo(taxid, progress=None):
     taxid = gene.NCBIGeneInfo.TAX_MAP.get(taxid, taxid)
-    sf.localpath_download(
+    serverfiles.localpath_download(
         "NCBI_geneinfo", "gene_info.{taxid}.db".format(taxid=taxid),
         callback=progress, verbose=True,
     )
@@ -380,15 +369,15 @@ def get_gene_network(ppidb, geneinfo, taxid, query_genes,
     return net
 
 
+from functools import partial
+from collections import defaultdict
+from itertools import count
+
+import numpy
+
+
 def extract_network(ppidb, query, geneinfo, include_neighborhood=True,
                     min_score=None, progress=None):
-    """
-    include neighborhood
-    """
-    from functools import partial
-    from collections import defaultdict
-    from itertools import count
-
     if not isinstance(query, dict):
         query = {name: name for name in query}
 
@@ -401,7 +390,8 @@ def extract_network(ppidb, query, geneinfo, include_neighborhood=True,
         if min_score is not None:
             raise ValueError("min_score used with BioGrid")
 
-    graph = Orange.network.Graph()
+#     graph = networkx.Graph()
+    graph = network.Graph()
     # node ids in Orange.network.Graph need to be in [0 .. n-1]
     nodeids = defaultdict(partial(next, count()))
 
@@ -478,39 +468,47 @@ def extract_network(ppidb, query, geneinfo, include_neighborhood=True,
                     graph.add_edge(nodeid1, nodeid2)
 
     nodedomain = Orange.data.Domain(
-        [Orange.feature.String("Query name"),  # if applicable
-         Orange.feature.String("id"),          # ppidb primary key
-         Orange.feature.String("Synonyms"),    # ppidb synonyms
-         Orange.feature.String("Symbol"),      # ncbi gene name ??
-         Orange.feature.Discrete("source", values=["false", "true"])],
-        None
+        [], [],
+        [Orange.data.StringVariable("Query name"),  # if applicable
+         Orange.data.StringVariable("id"),          # ppidb primary key
+         Orange.data.StringVariable("Synonyms"),    # ppidb synonyms
+         Orange.data.StringVariable("Symbol"),      # ncbi gene name ??
+         Orange.data.DiscreteVariable("source", values=["false", "true"])],
     )
-
+    N = len(graph.nodes())
     node_items = sorted(graph.node.items(), key=lambda t: nodeids[t[0]])
 
-    nodeitems = Orange.data.Table(
+    meta = [[node.get("query_name", ""),
+              node.get("key", ""),
+              ", ".join(node.get("synonyms", [])),
+              node.get("symbol", nodeid),
+              (1 if "query_name" in node else 0)]
+             for nodeid, node in node_items]
+    if not meta:
+        meta = numpy.empty((0, len(nodedomain.metas)),
+                           dtype=object)
+
+    nodeitems = Orange.data.Table.from_numpy(
         nodedomain,
-        [[str(node.get("query_name", "")),
-          str(node.get("key", "")),
-          str(", ".join(node.get("synonyms", []))),
-          str(node.get("symbol", nodeid)),
-          "true" if "query_name" in node else "false"]
-         for nodeid, node in node_items]
+        numpy.empty((N, 0)), numpy.empty((N, 0)),
+        numpy.array(meta, dtype=object)
     )
+
     graph.set_items(nodeitems)
+
     return graph
 
 
 def main():
-    from PyQt4.QtGui import QApplication
+    from AnyQt.QtWidgets import QApplication
     app = QApplication([])
     w = OWGeneNetwork()
     brown = Orange.data.Table("brown-selected")
     w.set_data(Orange.data.Table(brown[:5]))
     w.show()
-    app.exec_()
+    rval = app.exec_()
     w.saveSettings()
-    return 0
+    return rval
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

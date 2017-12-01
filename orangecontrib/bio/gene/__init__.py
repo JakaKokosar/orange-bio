@@ -1,42 +1,18 @@
-from __future__ import absolute_import
 import sys
+import pickle
 import os
 import time
 
-from ..utils import serverfiles
 
-from .. import taxonomy as obiTaxonomy
-from .. import kegg as obiKEGG
-
-from .. import dicty as obiDicty
-from .. import biomart as obiBioMart
-
-from . import homology
-
-#python3
-try:
-    basestring
-except NameError:
-    basestring = str
-
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
-
-try:
-    from urllib2 import urlopen
-except ImportError:
-    from urllib.request import urlopen
-
-try:
-    from Orange.utils import environ
-except ImportError:
-    from ..utils import environ
-
+from urllib.request import urlopen
 from functools import reduce
 
+from ..utils import serverfiles, environ
+from .. import taxonomy, kegg, dicty, biomart
+from . import homology
+
 default_database_path = serverfiles.localpath("NCBI_geneinfo")
+
 
 class GeneInfo(object):
     """ An object representing the NCBI information for a gene.
@@ -49,6 +25,7 @@ class GeneInfo(object):
     NCBI_MULTIPLE_CARDINALITY_TAGS = ("synonyms", "dbXrefs", "other_designations")
     
     __slots__ = NCBI_GENEINFO_TAGS
+
     def __init__(self, line):
         """ Construct the GeneInfo object from a line in the NCBI gene_info file
         """
@@ -73,9 +50,11 @@ class GeneInfo(object):
     def __str__(self):
         return repr(self)
 
+
 class GeneHistory(object):
     NCBI_GENE_HISTORY_TAGS = ("tax_id", "gene_id", "discontinued_gene_id", "discontinued_symbol", "discontinue_date")
     __slots__ = NCBI_GENE_HISTORY_TAGS
+
     def __init__(self, line):
         for attr, value in zip(self.__slots__, line.split("\t")):
             setattr(self, attr, value)
@@ -140,14 +119,14 @@ class NCBIGeneInfo(dict):
         elif org in NCBIGeneInfo.TAX_MAP:
             return NCBIGeneInfo.TAX_MAP[org]
 
-        taxids = obiTaxonomy.to_taxid(org, mapTo=cls.common_taxids())
+        taxids = taxonomy.to_taxid(org, mapTo=cls.common_taxids())
         if not taxids:
-            taxids = obiTaxonomy.search(org, onlySpecies=False)
+            taxids = taxonomy.search(org, onlySpecies=False)
             taxids = set(cls.common_taxids()).intersection(taxids) #onlySpecies=False needed to find correct dicty
         if len(taxids) == 0:
-            raise obiTaxonomy.UnknownSpeciesIdentifier(org)
+            raise taxonomy.UnknownSpeciesIdentifier(org)
         elif len(taxids) > 1:
-            raise obiTaxonomy.MultipleSpeciesException(", ".join(["%s: %s" % (id, obiTaxonomy.name(id)) for id in taxids]))
+            raise taxonomy.MultipleSpeciesException(", ".join(["%s: %s" % (id, taxonomy.name(id)) for id in taxids]))
         taxid = taxids.pop()
         return cls.TAX_MAP.get(taxid, taxid)
 
@@ -155,7 +134,7 @@ class NCBIGeneInfo(dict):
     def load(cls, file):
         """ A class method that loads gene info from file
         """
-        if type(file) in [str, unicode]:
+        if type(file) in [str]:
             file = open(file, "rb")
         return cls((line.split("\t", 3)[1], line) for line in file.read().splitlines() if line.strip() and not line.startswith("#"))
         
@@ -215,7 +194,7 @@ class NCBIGeneInfo(dict):
     @staticmethod
     def get_geneinfo_from_ncbi(file, progressCallback=None):
         import gzip, shutil, tempfile
-        if isinstance(file, basestring):
+        if isinstance(file, str):
             file = open(file, "wb")
         
         stream = urlopen("ftp://ftp.ncbi.nih.gov/gene/DATA/gene_info.gz")
@@ -228,7 +207,7 @@ class NCBIGeneInfo(dict):
     @staticmethod
     def get_gene_history_from_ncbi(file, progressCallback=None):
         import gzip, shutil, tempfile
-        if isinstance(file, basestring):
+        if isinstance(file, str):
             file = open(file, "wb")
         
         stream = urlopen("ftp://ftp.ncbi.nih.gov/gene/DATA/gene_history.gz")
@@ -240,12 +219,12 @@ class NCBIGeneInfo(dict):
         
     @classmethod
     def common_taxids(cls):
-        taxids = obiTaxonomy.common_taxids()
+        taxids = taxonomy.common_taxids()
         return [cls.TAX_MAP.get(id, id) for id in taxids if cls.TAX_MAP.get(id, id)]
     
     @classmethod
     def essential_taxids(cls):
-        taxids = obiTaxonomy.essential_taxids()
+        taxids = taxonomy.essential_taxids()
         return [cls.TAX_MAP.get(id, id) for id in taxids if cls.TAX_MAP.get(id, id)]
 
 
@@ -264,7 +243,7 @@ class EnsembleGeneInfo(object):
         
     @classmethod
     def organism_name_search(cls, name):
-        taxids = obiTaxonomy.to_taxid(name, mapTo=cls.common_taxids())
+        taxids = taxonomy.to_taxid(name, mapTo=cls.common_taxids())
         if len(taxids) == 1:
             return taxids[0]
         else:
@@ -288,7 +267,7 @@ class EnsembleGeneInfo(object):
         else:
             dset_name, attrs = self.default_biomart_conf(self.organism)
         
-        dataset = obiBioMart.BioMartDataset("ensembl", dset_name)
+        dataset = biomart.BioMartDataset("ensembl", dset_name)
         table = dataset.get_example_table(attributes=attrs, unique=True)
         table.save(dset_name + ".tab")
         from collections import defaultdict
@@ -299,7 +278,7 @@ class EnsembleGeneInfo(object):
         return names
         
     def default_biomart_conf(self, taxid):
-        name = obiTaxonomy.name(self.organism).lower()
+        name = taxonomy.name(self.organism).lower()
         name1, name2 = name.split(" ")[: 2]
         dset_name = name1[0] + name2 + "_gene_ensembl"
         return dset_name, self.DEF_ATTRS
@@ -673,16 +652,16 @@ class MatcherAliasesKEGG(MatcherAliasesPickled):
     """
 
     def _organism_name(self, organism):
-        return obiKEGG.organism_name_search(organism)
+        return kegg.organism_name_search(organism)
 
     def create_aliases(self):
-        org = obiKEGG.KEGGOrganism(self.organism, genematcher=GMDirect())
+        org = kegg.KEGGOrganism(self.organism, genematcher=GMDirect())
         osets = org.gene_aliases()
         return osets
 
     def create_aliases_version(self):
         # use KEGG short release string (e.g. '66.0+')
-        release = obiKEGG.KEGGOrganism.organism_version(self.organism) + ".2"
+        release = kegg.KEGGOrganism.organism_version(self.organism) + ".2"
         release, _ = release.split("/")
         return release
 
@@ -716,12 +695,12 @@ class MatcherAliasesGO(MatcherAliasesPickled):
 
     def _organism_name(self, organism):
         """ Returns internal GO organism name. Used to define file name. """
-        from .. import obiGO
-        return obiGO.organism_name_search(self.organism)
+        from orangecontrib.bio import go
+        return go.organism_name_search(self.organism)
 
     def create_aliases(self):
-        from .. import obiGO
-        annotations = obiGO.Annotations(self.organism, genematcher=GMDirect())
+        from orangecontrib.bio import go
+        annotations = go.Annotations(self.organism, genematcher=GMDirect())
         names = annotations.gene_names_dict
         return map(set, list(set([ \
             tuple(sorted(set([name]) | set(genes))) \
@@ -731,8 +710,8 @@ class MatcherAliasesGO(MatcherAliasesPickled):
         return "go_" + self._organism_name(self.organism)
 
     def create_aliases_version(self):
-        from .. import obiGO
-        return "v2." + obiGO.Annotations.organism_version(self.organism)
+        from orangecontrib.bio import go
+        return "v2." + go.Annotations.organism_version(self.organism)
 
     def __init__(self, organism, ignore_case=True):
         self.organism = organism
@@ -743,7 +722,7 @@ class MatcherAliasesDictyBase(MatcherAliasesPickled):
     """
 
     def create_aliases(self):
-        db = obiDicty.DictyBase()
+        db = dicty.DictyBase()
         #db.info, db.mappings
         infoa = [ set([id,name]) | set(aliases) for id,(name,aliases,_) in db.info.items() ]
         mappingsa = [ set(filter(None, a)) for a in db.mappings ]
@@ -751,7 +730,7 @@ class MatcherAliasesDictyBase(MatcherAliasesPickled):
         return joineda
 
     def create_aliases_version(self):
-        return "v1." + obiDicty.DictyBase.version()
+        return "v1." + dicty.DictyBase.version()
 
     def filename(self):
         return "dictybase" 
@@ -817,13 +796,13 @@ class MatcherAliasesEnsembl(MatcherAliasesPickled):
         return "v1"
     
     def create_aliases(self):
-        from .. import obiBioMart
+        from orangecontrib.bio import biomart
         if self.organism in self.BIOMART_CONF:
             dset_name, attrs = self.BIOMART_CONF[self.organism]
         else:
             dset_name, attrs = self.default_biomart_conf(self.organism)
         
-        dataset = obiBioMart.BioMartDataset("ensembl", dset_name)
+        dataset = biomart.BioMartDataset("ensembl", dset_name)
         table = dataset.get_example_table(attributes=attrs)
         from collections import defaultdict
         names = defaultdict(set)
@@ -833,7 +812,7 @@ class MatcherAliasesEnsembl(MatcherAliasesPickled):
         return names.values()
         
     def default_biomart_conf(self, taxid):
-        name = obiTaxonomy.name(self.organism).lower()
+        name = taxonomy.name(self.organism).lower()
         name1, name2 = name.split(" ")[: 2]
         dset_name = name1[0] + name2 + "_gene_ensembl"
         return dset_name, self.DEF_ATTRS
@@ -961,7 +940,7 @@ GMAffy = MatcherAliasesAffy
 GMEnsembl = MatcherAliasesEnsembl
 
 def issequencens(x):
-    return hasattr(x, '__getitem__') and not isinstance(x, basestring)
+    return hasattr(x, '__getitem__') and not isinstance(x, str)
 
 def matcher(matchers, direct=True, ignore_case=True):
     """

@@ -1,8 +1,8 @@
-from six import StringIO
 import doctest
-
 import unittest
 
+
+from io import StringIO
 from orangecontrib.bio.kegg.entry import parser, fields, DBEntry, entry_decorate
 
 

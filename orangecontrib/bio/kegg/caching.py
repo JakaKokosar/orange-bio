@@ -4,22 +4,15 @@ Caching framework for cached kegg api calls.
 """
 import os
 import sqlite3
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
+import pickle
 
 from contextlib import closing
-
 from datetime import datetime, date, timedelta
 from . import conf
 
-import six
 
-try:
-    from UserDict import DictMixin
-except ImportError:
-    from collections import MutableMapping as DictMixin
+from collections import MutableMapping as DictMixin
+
 
 class Store(object):
     def __init__(self):
@@ -63,8 +56,6 @@ class Sqlite3Store(Store, DictMixin):
             raise KeyError(key)
         else:
             pickle_str = r[0][0]
-            if not six.PY3:
-                pickle_str = str(pickle_str)
             try:
                 return pickle.loads(pickle_str)
             except Exception:

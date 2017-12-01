@@ -2,41 +2,35 @@
 Enrichment analysis on MapMan ontologies
 ----------------------------------------
 """
-import sys
-import os
 import csv
-import warnings
 import enum
-import io
 import gzip
-
-import tempfile
-import numbers
-
-import pickle
-import logging
+import io
 import itertools
-
+import logging
+import numbers
+import os
+import pickle
+import sys
+import tempfile
 import urllib.parse
-
+import warnings
 from collections import defaultdict, deque, namedtuple, OrderedDict
 from itertools import chain
-from xml.sax.saxutils import escape
-
 from types import SimpleNamespace as namespace
-
 from typing import (
     Dict, List, Tuple, Optional, Union, Any, Iterable, Sequence, Callable,
     Generic, TypeVar, Hashable
 )
+from xml.sax.saxutils import escape
 
 import numpy
-
 from AnyQt.QtCore import (
     Qt, QSize, QModelIndex, QAbstractProxyModel,
     QSortFilterProxyModel, QItemSelection, QItemSelectionRange,
     QItemSelectionModel, QEvent
 )
+from AnyQt.QtCore import pyqtSlot as Slot
 from AnyQt.QtGui import QStandardItemModel, QStandardItem, QPalette
 from AnyQt.QtWidgets import (
     QWidget, QTreeView, QComboBox, QApplication, QSplitter,
@@ -44,20 +38,17 @@ from AnyQt.QtWidgets import (
     QStyledItemDelegate, QHBoxLayout, QSizePolicy,
     QStyle, QStylePainter, QStyleOptionComboBox, QToolTip
 )
-from AnyQt.QtCore import pyqtSlot as Slot
+from orangecontrib.bio.widgets.OWFeatureSelection import copy_variable
 
 import Orange.data
 from Orange.widgets import widget, gui, settings
-
-from orangecontrib.bio import ontology
 from orangecontrib.bio import gene
+from orangecontrib.bio import ontology
 from orangecontrib.bio.utils import stats, environ
+from orangecontrib.bio.widgets.OWGEODatasets import retrieve_url
+from orangecontrib.bio.widgets.utils.data import append_columns
+from orangecontrib.bio.widgets.utils import disconnected, group_ranges
 
-from orangecontrib.bio.widgets3.OWGEODatasets import retrieve_url
-
-from orangecontrib.bio.widgets3.utils import disconnected, group_ranges
-from orangecontrib.bio.widgets3.utils.data import append_columns
-from orangecontrib.bio.widgets3.OWFeatureSelection import copy_variable
 
 def download_file(url, targetpath, progress=None):
     # type: (str, str, Optional[Callable[[int, int], None]]) -> None

@@ -1,785 +1,847 @@
 """
-<name>Vulcano Plot</name>
-<description>Plots fold change vs. p-value.)</description>
-<priority>1020</priority>
-<contact>Ales Erjavec (ales.erjavec@fri.uni-lj.si)</contact>
-<icon>icons/VulcanoPlot.svg</icon>
+Volcano plot
+------------
+
 """
-
-from __future__ import absolute_import
-
-from operator import add
-from collections import defaultdict
+import sys
+from contextlib import contextmanager
+from functools import partial
+from typing import List
 
 import numpy
+import pyqtgraph as pg
+import scipy.stats
+from AnyQt.QtCore import (
+    Qt, QEvent, QObject, QPointF, QRectF, QSize, QPoint, QRect, Signal
+)
+from AnyQt.QtGui import QPainter, QBrush, QPen, QStandardItemModel
+from AnyQt.QtWidgets import (
+    QGraphicsView, QGraphicsItemGroup, QGraphicsRectItem, QToolTip,
+    QFormLayout, QCheckBox
+)
+from orangecontrib.bio.widgets.utils.settings import SetContextHandler
 
-import orange
+import Orange.data
+from Orange.widgets import widget, gui, settings
+from Orange.widgets.utils.datacaching import data_hints
+from orangecontrib.bio.widgets.utils import gui as guiutils
+from orangecontrib.bio.widgets.utils import group as grouputils
 
-from Orange.orng.orngDataCaching import data_hints
-from Orange.OrangeWidgets.OWToolbars import ZoomSelectToolbar
-from Orange.OrangeWidgets.OWWidget import *
-from Orange.OrangeWidgets.OWGraph import *
-from Orange.OrangeWidgets import OWGUI
-
-from .. import obiExpression
-
-NAME = "Vulcano Plot"
-DESCRIPTION = "Plots fold change vs. p-value.)"
-ICON = "icons/VulcanoPlot.svg"
+NAME = "Volcano Plot"
+DESCRIPTION = "Plots fold change vs. p-value."
+ICON = "icons/VolcanoPlot.svg"
 PRIORITY = 1020
 
-INPUTS = [("Examples", Orange.data.Table, "setData")]
-OUTPUTS = [("Examples with selected attributes", Orange.data.Table)]
+INPUTS = [("Data", Orange.data.Table, "set_data")]
+OUTPUTS = [("Data subset", Orange.data.Table)]
 
 REPLACES = ["_bioinformatics.widgets.OWVulcanoPlot.OWVulcanoPlot"]
 
 
-class GraphSelections(QObject):
-    """ Selection manager using a union of rectangle areas 
+@contextmanager
+def blocked_signals(qobj):
     """
+    Context manager blocking the `qobj` signals.
+    """
+    state = qobj.signalsBlocked()
+    qobj.blockSignals(True)
+    try:
+        yield qobj
+    finally:
+        qobj.blockSignals(state)
+
+
+class GraphSelections(QObject):
+    """
+    Selection manager using a union of rectangle areas.
+    """
+    selectionStarted = Signal()
+    selectionGeometryChanged = Signal()
+    selectionFinished = Signal()
+
     def __init__(self, parent):
         QObject.__init__(self, parent)
         self.selection = []
-        
-    def getPos(self, event):
-        graph = self.parent()
-        pos = graph.canvas().mapFrom(graph, event.pos())
-        x = graph.invTransform(QwtPlot.xBottom, pos.x())
-        y = graph.invTransform(QwtPlot.yLeft, pos.y())
-        return QPointF(x, y)
-        
+
+    def mapToView(self, pos):
+        """
+        Map the `pos` in viewbox local into the view (plot) coordinates.
+        """
+        viewbox = self.parent()
+        return viewbox.mapToView(pos)
+
     def start(self, event):
-        pos = self.getPos(event)
+        pos = self.mapToView(event.pos())
         if event.modifiers() & Qt.ControlModifier:
             self.selection.append((pos, pos))
         else:
             self.selection = [(pos, pos)]
-        self.emit(SIGNAL("selectionGeometryChanged()"))
-    
+        self.selectionStarted.emit()
+        self.selectionGeometryChanged.emit()
+
     def update(self, event):
-        pos = self.getPos(event)
+        pos = self.mapToView(event.pos())
         self.selection[-1] = self.selection[-1][:-1] + (pos,)
-        self.emit(SIGNAL("selectionGeometryChanged()"))
-    
+        self.selectionGeometryChanged.emit()
+
     def end(self, event):
         self.update(event)
-        
+        self.selectionFinished.emit()
+
     def testSelection(self, data):
+        """
+        Given a
+
+        Parameters
+        ----------
+        data : (N, 2) array
+            Point coordinates
+
+        """
         if len(data) == 0:
-            return []
+            return numpy.zeros(0, dtype=bool)
+
+        def contained(a, left, top, right, bottom):
+            assert left <= right and bottom <= top
+            x, y = a.T
+            return (x >= left) & (x <= right) & (y <= top) & (y >= bottom)
+
         data = numpy.asarray(data)
-        region = QPainterPath()
+        selected = numpy.zeros(len(data), dtype=bool)
         for p1, p2 in self.selection:
-            region.addRect(QRectF(p1, p2).normalized())
-        def test(point):
-            return region.contains(QPointF(point[0], point[1]))
-        test = numpy.apply_along_axis(test, 1, data)
-        return test
-        
+            r = QRectF(p1, p2).normalized()
+            # Note the inverted top/bottom (Qt coordinate system)
+            selected |= contained(data, r.left(), r.bottom(),
+                                  r.right(), r.top())
+        return selected
+
+    def mousePressEvent(self, event):
+        """
+        Handle the intercepted mouse event.
+
+        Return True if the event has been handled, False otherwise
+        (let the viewbox handle the event).
+        """
+        if event.button() == Qt.LeftButton:
+            self.start(event)
+            event.accept()
+            return True
+        else:
+            return False
+
+    def mouseMoveEvent(self, event):
+        """
+        Handle the intercepted mouse event.
+
+        Return True if the event has been handled, False otherwise
+        (let the viewbox handle the event).
+        """
+        if event.buttons() & Qt.LeftButton:
+            self.update(event)
+            event.accept()
+            return True
+        else:
+            return False
+
+    def mouseReleaseEvent(self, event):
+        """
+        Handle the intercepted mouse event.
+
+        Return True if the event has been handled, False otherwise
+        (let the viewbox handle the event).
+        """
+        if event.button() == Qt.LeftButton:
+            self.update(event)
+            self.end(event)
+            event.accept()
+            return True
+        else:
+            return False
+
+    def eventFilter(self, obj, event):
+        if obj is self.parent():
+            if event.type() == QEvent.GraphicsSceneMousePress:
+                return self.mousePressEvent(event)
+            elif event.type() == QEvent.GraphicsSceneMouseMove:
+                return self.mouseMoveEvent(event)
+            elif event.type() == QEvent.GraphicsSceneMouseRelease:
+                return self.mouseReleaseEvent(event)
+
+        return QObject.eventFilter(self, obj, event)
+
+
 class SymetricSelections(GraphSelections):
-    """ Selection manager using two symmetric areas extending to 'infinity'  
+    """
+    Selection manager using two symmetric areas extending to 'infinity'.
     """
     def __init__(self, parent, x=3, y=3):
         GraphSelections.__init__(self, parent)
-        max = 100000
-        self.selection = [(QPointF(-max, max), QPointF(-x, y)), (QPointF(max, max), QPointF(x, y))]
-        self.updateAxes = None
-        
-    def updateSelection(self, axes, pos):
-        if axes == QwtPlot.xBottom or axes == -1:
+        # fmax = numpy.finfo(float).max
+        fmax = 2 ** 20
+        self.selection = [(QPointF(-fmax, fmax), QPointF(-x, y)),
+                          (QPointF(fmax, fmax), QPointF(x, y))]
+        self.__constraints = Qt.Vertical | Qt.Horizontal
+
+    def __setpos(self, constraint, pos):
+        """
+        Set the position of the selection rectangles 'free' corner.
+        """
+        if constraint & Qt.Horizontal:
             self.selection[0][1].setX(-abs(pos.x()))
             self.selection[1][1].setX(abs(pos.x()))
-        if axes == QwtPlot.yLeft or axes == -1:
+
+        if constraint & Qt.Vertical:
             self.selection[0][1].setY(pos.y())
             self.selection[1][1].setY(pos.y())
-            
-        self.emit(SIGNAL("selectionGeometryChanged()"))
-        
-    def getAxesAndPos(self, event):
-        graph = self.parent()
-        pos = graph.canvas().mapFrom(graph, event.pos())
-        x = graph.invTransform(QwtPlot.xBottom, pos.x())
-        y = graph.invTransform(QwtPlot.yLeft, pos.y())
-        
-        offset = 3
-        dx = abs(graph.invTransform(QwtPlot.xBottom, pos.x() + offset) - x)
-        dy = abs(graph.invTransform(QwtPlot.yLeft, pos.y() + offset) - y)
-        
-        x = abs(x)
-        
+        self.selectionGeometryChanged.emit()
+
+    def __testaxis(self, event):
+        viewbox = self.parent()
+        widget = event.widget()
+        assert widget is not None
+        view = widget.parent()
+        assert isinstance(view, QGraphicsView)
+        pos = view.mapFromGlobal(event.screenPos())
+        hitarea = view.mapToScene(QRect(pos - QPoint(2, 2), QSize(4, 4)))
+        hitarea = viewbox.mapFromScene(hitarea)
+        hitarea = viewbox.mapToView(hitarea).boundingRect()
+        center = hitarea.center()
+
+        if center.x() < 0:
+            hitarea.moveCenter(QPointF(-center.x(), center.y()))
+
         cx = self.selection[1][1].x()
         cy = self.selection[1][1].y()
-
-        bottom = QRectF(QPointF(cx, cy), QPointF(graph.maxX, cy)).adjusted(-dx, dy, dx, -dy).normalized()
-        left = QRectF(QPointF(cx, graph.maxY), QPointF(cx, cy)).adjusted(-dx, dy, dx, -dy).normalized()
-        
-        if bottom.contains(QPointF(x, y)) or bottom.contains(QPointF(-x, y)):
-            axes = QwtPlot.yLeft
-        elif left.contains(QPointF(x, y)) or left.contains(QPointF(-x, y)):
-            axes = QwtPlot.xBottom
+        if hitarea.contains(QPointF(cx, cy)):
+            axes = Qt.Horizontal | Qt.Vertical
+        elif hitarea.bottom() > cy > hitarea.top() and hitarea.left() > cx:
+            axes = Qt.Vertical
+        elif hitarea.left() < cx < hitarea.right() and hitarea.bottom() > cy:
+            axes = Qt.Horizontal
         else:
-            axes = -1
-        return axes, QPointF(x, y)
-        
+            axes = 0
+        return axes
+
     def start(self, event):
-        axes, pos = self.getAxesAndPos(event)
-        self.updateAxes = axes
-        self.updateSelection(axes, pos)
-        
+        constraints = self.__testaxis(event)
+        pos = self.mapToView(event.pos())
+        self.__constraints = (constraints or (Qt.Vertical | Qt.Horizontal))
+        self.selectionStarted.emit()
+        self.__setpos(self.__constraints, pos)
+
     def update(self, event):
-        _, pos = self.getAxesAndPos(event)
-        self.updateSelection(self.updateAxes, pos)
-    
+        pos = self.mapToView(event.pos())
+        self.__setpos(self.__constraints, pos)
+
     def end(self, event):
         self.update(event)
-        self.updateAxes = None
-        
+        self.__constraints = Qt.Vertical + Qt.Horizontal
+        self.selectionFinished.emit()
+
     def testSelection(self, data):
         if len(data) == 0:
-            return []
+            return numpy.empty(0, dtype=bool)
+
         data = numpy.asarray(data)
         cutoffX = self.selection[1][1].x()
         cutoffY = self.selection[1][1].y()
         return (numpy.abs(data[:, 0]) >= cutoffX) & (data[:, 1] >= cutoffY)
 
-    def cuttoff(self):
+    def cutoff(self):
         """
         Return the absolute x, y cutoff values.
         """
         return (self.selection[1][1].x(), self.selection[1][1].y())
 
-from Orange.OrangeWidgets.OWItemModels import PyListModel
+    def setCutoff(self, x, y):
+        if (x, y) != self.cutoff():
+            self.__setpos(Qt.Vertical | Qt.Horizontal, QPointF(x, y))
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.GraphicsSceneHoverMove:
+            axes = self.__testaxis(event)
+            if axes == Qt.Horizontal:
+                self.parent().setCursor(Qt.SizeHorCursor)
+            elif axes == Qt.Vertical:
+                self.parent().setCursor(Qt.SizeVerCursor)
+            else:
+                self.parent().setCursor(Qt.ArrowCursor)
+        return super().eventFilter(obj, event)
 
 
-def item_selection(indices, model, selection=None, column=0):
-    """ Create an QItemSelection for indices in model.
-    """
-    if selection is None:
-        selection = QItemSelection()
-        
-    for i in indices:
-        selection.select(model.index(i, column))
-    return selection
+class ScatterPlotItem(pg.ScatterPlotItem):
+    def paint(self, painter, option, widget):
+        if self.opts["antialias"]:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+        if self.opts["pxMode"]:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        super().paint(painter, option, widget)
 
 
-class LabelSelectionWidget(QWidget):
-    """ A widget for selection of label values.
-    """
-    def __init__(self, parent=None):
-        QWidget.__init__(self, parent)
-        self._values_model = PyListModel([], parent=self)
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        def group_box(title):
-            box = QGroupBox(title)
-            box.setFlat(True)
-            lay = QVBoxLayout()
-            lay.setContentsMargins(0, 0, 0, 0)
-            box.setLayout(lay)
-            return box
-        
-        self.labels_combo = QComboBox()
-        self.values_view = QListView()
-        self.values_view.setSelectionMode(QListView.ExtendedSelection)
-        self.values_view.setModel(self._values_model)
-        
-        
-        self.connect(self.labels_combo, SIGNAL("activated(int)"),
-                     self.on_label_activated)
-        
-        self.connect(self.values_view.selectionModel(),
-                     SIGNAL("selectionChanged(QItemSelection, QItemSelection)"),
-                     self.on_values_selection)
-        
-        l_box = group_box("Label")
-        v_box = group_box("Values")
-        
-        l_box.layout().addWidget(self.labels_combo)
-        v_box.layout().addWidget(self.values_view)
-        
-        layout.addWidget(l_box)
-        layout.addWidget(v_box)
-        
-        self.setLayout(layout)
-        
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        
-        self._block_selection_emit = False
-        
-        self.labels = []
-        self.set_labels([])
-        
-    def clear(self):
-        self.labels_combo.clear()
-        self._values_model[:] = []
-        self.labels = []
-        
-    def set_labels(self, labels):
-        """ Set the labels to display.
-        """
-        self.clear()
-        if isinstance(labels, dict):
-            labels = labels.items()
-            
-        self.labels = labels
-        for label, values in labels:
-            self.labels_combo.addItem(label)
-            
-        if labels:
-            self.set_current_label(0)
-#            self.labels_combo.setCurrentIndex(0)
-            
-    def set_selection(self, label, values):
-        """ Set the selection to label and values
-        """
-        if isinstance(label, basestring):
-            labels = [l for l, _ in self.labels]
-            index = labels.index(label) if label in labels else -1
-        else:
-            index = label
-            
-        if index >= 0:
-            if index != self.labels_combo.currentIndex():
-                self.set_current_label(index)
-                
-            all_values = list(self._values_model)
-            values = [v for v in values if v in all_values]
-            selection = QItemSelection()
-            for i, v in enumerate(self._values_model):
-                if v in values:
-                    index = self._values_model.index(i, 0)
-                    selection.select(index, index)
-            self.values_view.selectionModel().select(selection,  QItemSelectionModel.ClearAndSelect)
-        else:
-            self.values_view.selectionModel().clear()
-            
-    def set_current_label(self, index):
-        """ Set the current label
-        """
-        self.labels_combo.setCurrentIndex(index)
-        label, values = self.labels[index]
-        # Block selection changed
-        with self._blocked_signals():
-            self._values_model[:] = values
-        
-    def on_label_activated(self, index):
-        label, values = self.labels[index]
-        with self._blocked_signals():
-            self._values_model[:] = values
-        self.emit(SIGNAL("label_activated()"))
-        self.emit(SIGNAL("label_activated(int)"), index)
-    
-    def on_values_selection(self, selected, deselected):
-        label, values = self.current_selection()
-        self.emit(SIGNAL("selection_changed()"))
-        self.emit(SIGNAL("selection_changed(PyQt_PyObject, PyQt_PyObject)"),
-                  label, values)
-        
-    def selection_indexes(self):
-        """ Return the values selection indices.
-        """
-        selection = self.values_view.selectionModel().selection()
-        indexes = selection.indexes()
-        return sorted(set([i.row() for i in indexes]))        
-        
-    def current_selection(self):
-        """ Return the current label and selected values.
-        """
-        i = self.labels_combo.currentIndex()
+class VolcanoGraph(pg.PlotWidget):
+    selectionChanged = Signal()
 
-        if i == -1:
-            # When clearing the labels model / combobox
-            return None, None
+    #: Selection Modes
+    NoSelection, SymetricSelection, RectSelection = 0, 1, 2
 
-        label, all_values = self.labels[i]
-        values = [all_values[i] for i in self.selection_indexes()]
-        return label, values
-    
-    def _blocked_signals(self):
-        """ Return a context handler blocking all emited signals from this
-        object.
-         
-        """
-        class block(object):
-            def __enter__(blocker):
-                self.blockSignals(True)
-            def __exit__(blocker, *args):
-                self.blockSignals(False)
-                return False
-        return block()
-                
-    def sizeHint(self):
-        return QSize(100, 200)
+    def __init__(self, parent=None, symbolSize=5, **kwargs):
+        pg.PlotWidget.__init__(self, parent, **kwargs)
 
+        self.getAxis("bottom").setLabel("log<sub>2</sub> (ratio)")
+        self.getAxis("left").setLabel("-log<sub>10</sub> (P_value)")
 
-class VulcanoGraph(OWGraph):
-    def __init__(self, *args, **kwargs):
-        OWGraph.__init__(self, *args, **kwargs)
         # Absolute cutoff values for symmetric selection mode.
         self.cutoffX = 2.0
         self.cutoffY = 2.0
         # maximum absolute x, y values.
-        self.maxX, self.maxY = 10, 10
-        self.symbolSize = 5
-        self.symetricSelections = True
+        self.maxX, self.maxY = 10., 10.
+        self.symbolSize = symbolSize
 
-        self.selectedCurve = self.addCurve("", brushColor=Qt.red)
-        self.unselectedCurve = self.addCurve("", brushColor=Qt.blue)
+        self.__selectionMode = VolcanoGraph.NoSelection
+        self.__selectiondelegate = None
+        self._item = None
+        self._selitem = None
+        self.plotData = numpy.empty((0, 2))
+        self._stylebrush = numpy.array([
+            pg.mkBrush((0, 0, 255, 100)),  # normal points
+            pg.mkBrush((255, 0, 0, 100))   # selected points
+        ])
 
-        self.plotValues = {}
+    def setSelectionMode(self, mode):
+        if mode != self.__selectionMode:
+            viewbox = self.getViewBox()
+            viewbox.setAcceptHoverEvents(True)
+            if self.__selectiondelegate is not None:
+                viewbox.removeEventFilter(self.__selectiondelegate)
+                self.__selectiondelegate.deleteLater()
+                self.__selectiondelegate = None
 
-        self.setAxisAutoScale(QwtPlot.xBottom)
-        self.setAxisAutoScale(QwtPlot.yLeft)
+            self.__selectionMode = mode
+            if mode == VolcanoGraph.SymetricSelection:
+                self.__selectiondelegate = SymetricSelections(
+                    viewbox,
+                    x=min(self.maxX, self.cutoffX),
+                    y=min(self.maxY, self.cutoffY)
+                )
+                viewbox.installEventFilter(self.__selectiondelegate)
+            elif mode == VolcanoGraph.RectSelection:
+                self.__selectiondelegate = GraphSelections(viewbox)
+                viewbox.installEventFilter(self.__selectiondelegate)
+            else:
+                pass
 
-        self.setSelection(
-            SymetricSelections(
-                self,
-                x=min(self.maxX, self.cutoffX),
-                y=min(self.maxY, self.cutoffY))
-        )
+            if self.__selectiondelegate is not None:
+                self.__selectiondelegate.selectionGeometryChanged.connect(
+                    self.__on_selectionChanged)
 
-    def setSelection(self, selection):
-        self.selection = selection
-        self.connect(self.selection, SIGNAL("selectionGeometryChanged()"), self.onSelectionChanged)
-        if self.plotValues:
-            self.updateSelectionArea()
+            if self.plotData.size:
+                self.updateSelectionArea()
 
-    def onSelectionChanged(self):
-        if self.symetricSelections:
-            self.cutoffX, self.cutoffY = self.selection.cuttoff()
+            self.selectionChanged.emit()
 
-        self.replot_()
-        self.emit(SIGNAL("selectionChanged()"))
+    def selectionMode(self):
+        return self.__selectionMode
 
-    def splitSelected(self):
-        test =  self.selection.testSelection(self.plotData)
-        return (self.plotData[numpy.nonzero(test)], self.plotData[numpy.nonzero(~test)])
+    def setSelectionCut(self, x, y):
+        if (x, y) != (self.cutoffX, self.cutoffY):
+            self.cutoffX, self.cutoffY = x, y
+            if self.__selectionMode == VolcanoGraph.SymetricSelection:
+                assert isinstance(self.__selectiondelegate, SymetricSelections)
+                self.__selectiondelegate.setCutoff(x, y)
 
-    def setPlotValues(self, values):
-        self.plotValues = values
-        self.plotData = numpy.array(values.values())
+    def selectionCut(self):
+        return self.cutoffX, self.cutoffY
+
+    def __on_selectionChanged(self):
+        if self.__selectionMode == VolcanoGraph.SymetricSelection:
+            self.cutoffX, self.cutoffY = self.__selectiondelegate.cutoff()
+
+        self.updateSelectionArea()
+
+        self.selectionChanged.emit()
+
+    def selectionMask(self):
+        if self.__selectiondelegate is not None:
+            return self.__selectiondelegate.testSelection(self.plotData)
+        else:
+            return numpy.zeros((len(self.plotData), ), dtype=bool)
+
+    def setPlotData(self, data):
+        self.plotData = numpy.asarray(data)
         if self.plotData.size:
             self.maxX = numpy.max(numpy.abs(self.plotData[:, 0]))
             self.maxY = numpy.max(self.plotData[:, 1])
         else:
-            self.maxX, self.maxY = 10, 10
+            self.maxX, self.maxY = 10., 10.
 
-        self.setAxisScale(QwtPlot.xBottom, -self.maxX, self.maxX)
-        self.setAxisScale(QwtPlot.yLeft, 0.0, self.maxY)
         self.replot_()
-        self.emit(SIGNAL("selectionChanged()"))
 
-    def createSelectionRectCurve(self, p1, p2):
-        curve = self.addCurve("selection", style=QwtPlotCurve.Lines, penColor=Qt.red, symbol=QwtSymbol.NoSymbol)
-        curve.setData([p1.x(), p2.x(), p2.x(), p1.x(), p1.x()], [p1.y(), p1.y(), p2.y(), p2.y(), p1.y()])
-        
-    def items(self, title=None):
-        for item in self.itemList():
-            if str(item.title().text()) == title:
-                yield item
-        
+        self.setRange(QRectF(-self.maxX, 0, 2 * self.maxX, self.maxY))
+        self.selectionChanged.emit()
+
+    def setSymbolSize(self, size):
+        if size != self.symbolSize:
+            self.symbolSize = size
+            if self._item is not None:
+                self._item.setSize(size)
+
     def updateSelectionArea(self):
-        for c in self.items(title="selection"):
-            c.detach()
-        for p1, p2 in self.selection.selection:
-            self.createSelectionRectCurve(p1, p2)
+        mask = self.selectionMask()
+        brush = self._stylebrush[mask.astype(int)]
+        if self._item is not None:
+            self._item.setBrush(brush)
+
+        if self._selitem is not None:
+            self.removeItem(self._selitem)
+            self._selitem = None
+
+        if self.__selectiondelegate is not None:
+            self._selitem = QGraphicsItemGroup()
+            self._selitem.dataBounds = \
+                lambda axis, frac=1.0, orthoRange=None: None
+
+            for p1, p2 in self.__selectiondelegate.selection:
+                r = QRectF(p1, p2).normalized()
+                ritem = QGraphicsRectItem(r, self._selitem)
+                ritem.setBrush(QBrush(Qt.NoBrush))
+                ritem.setPen(QPen(Qt.red, 0))
+
+            self.addItem(self._selitem)
 
     def replot_(self):
-        if self.plotValues:
-            selected, unselected = self.splitSelected()
-            self.selectedCurve.setData(selected[:, 0], selected[:, 1])
-            self.unselectedCurve.setData(unselected[:, 0], unselected[:, 1])
+        if self.plotData.size:
+            if self._item is not None:
+                self.removeItem(self._item)
+
+            mask = self.selectionMask()
+            brush = self._stylebrush[mask.astype(int)]
+            self._item = ScatterPlotItem(
+                x=self.plotData[:, 0], y=self.plotData[:, 1],
+                brush=brush, size=self.symbolSize, antialias=True,
+                data=numpy.arange(len(self.plotData))
+            )
+            self.addItem(self._item)
+
             self.updateSelectionArea()
         else:
-            for curve in [self.selectedCurve, self.unselectedCurve]:
-                curve.setData([], [])
-        self.replot()
+            self.removeItem(self._item)
+            self._item = None
 
-    def mousePressEvent(self, event):
-        canvas = self.canvas()
-        canvasPos = canvas.mapFrom(self, event.pos())
-        if canvas.contentsRect().contains(canvasPos) and \
-                self.state == SELECT and event.button() == Qt.LeftButton:
-            self.selection.start(event)
-        else:
-            OWGraph.mousePressEvent(self, event)
+    def clearPlot(self):
+        self._item = None
+        self._selitem = None
+        self.plotData = numpy.empty((0, 2))
+        self.clear()
+        self.selectionChanged.emit()
 
-    def mouseMoveEvent(self, event):
-        if self.state == SELECT:
-            if event.buttons() & Qt.LeftButton:
-                self.selection.update(event)
-            if isinstance(self.selection, SymetricSelections):
-                axes, pos = self.selection.getAxesAndPos(event)
-                cursors = {QwtPlot.xBottom: Qt.SizeHorCursor,
-                           QwtPlot.yLeft: Qt.SizeVerCursor}
-                self.canvas().setCursor(cursors.get(axes, self._cursor))
-        else:
-            OWGraph.mouseMoveEvent(self, event)
-
-    def mouseReleaseEvent(self, event):
-        if self.state == SELECT:
-            if event.button() == Qt.LeftButton:
-                self.selection.end(event)
-        else:
-            OWGraph.mouseReleaseEvent(self, event)
-
-    def reselect(self, replot=True):
-        if self.symetricSelections:
-            self.setSelection(
-                SymetricSelections(
-                    self,
-                    x=min(self.maxX, self.cutoffX),
-                    y=min(self.maxY, self.cutoffY))
-            )
-        else:
-            self.setSelection(GraphSelections(self))
-            self.canvas().setCursor(self._cursor)
-        if replot:
-            self.replot_()
-
-    def updateSymbolSize(self):
-        def setSize(curve, size):
-            symbol = curve.symbol()
-            symbol.setSize(size)
-            if QWT_VERSION_STR >= "5.2":
-                curve.setSymbol(symbol)
-        setSize(self.selectedCurve, self.symbolSize)
-        setSize(self.unselectedCurve, self.symbolSize)
-        self.replot()
+    def sizeHint(self):
+        return QSize(500, 500)
 
 
-from .OWGenotypeDistances import SetContextHandler
-from .OWFeatureSelection import disable_controls
+class OWVolcanoPlot(widget.OWWidget):
+    name = NAME
+    description = DESCRIPTION
+    icon = "../widgets/icons/VulcanoPlot.svg"
+    priority = PRIORITY
 
+    inputs = INPUTS
+    outputs = OUTPUTS
 
-class OWVulcanoPlot(OWWidget):
-    settingsList = ["graph.cutoffX", "graph.cutoffY", "graph.symbolSize",
-                    "graph.symetricSelections", "showXTitle", "showYTitle"]
+    settingsHandler = SetContextHandler()
 
-    contextHandlers = {
-        "targets": SetContextHandler("targets")
-    }
+    symbol_size = settings.Setting(5)
+    symetric_selections = settings.Setting(True)
+    auto_commit = settings.Setting(False)
 
-    def __init__(self, parent=None, signalManager=None, name="Vulcano Plot"):
-        OWWidget.__init__(self, parent, signalManager, name, wantGraph=True)
+    current_group_index = settings.ContextSetting(-1)
+    #: stored selection indices (List[int]) for every split group.
+    stored_selections = settings.ContextSetting([])  # type: List[int]
 
-        self.inputs = [("Examples", ExampleTable, self.setData)]
-        self.outputs = [("Examples with selected attributes", ExampleTable)]
+    #: The (abs) selection cut on the log(ratio) scale (X axis)
+    cut_log_r = settings.Setting(2.0)  # type: float
+    #: The selection cut on on log(p_value) scale (Y axis)
+    cut_log_p = settings.Setting(2.0)  # type: float
 
-        self.genes_in_columns = False
+    graph_name = "graph.plotItem"
 
-        self.showXTitle = True
-        self.showYTitle = True
-
-        self.auto_commit = False
-        self.selection_changed_flag = False
-        self.target_group = None, []
-        self.label_selections = []
-
-        self.graph = VulcanoGraph(self)
-        self.connect(self.graph, SIGNAL("selectionChanged()"),
-                     self.on_selection_changed)
-        self.mainArea.layout().addWidget(self.graph)
-
-        self.loadSettings()
-
-        ## GUI
-        box = OWGUI.widgetBox(self.controlArea, "Info")
-        self.infoLabel = OWGUI.label(box, self, "")
-        self.infoLabel.setText("No data on input")
-        self.infoLabel2 = OWGUI.label(box, self, "")
-        self.infoLabel2.setText("0 selected genes")
-        
-        box = OWGUI.widgetBox(self.controlArea, "Target Labels")
-        
-        self.target_widget = LabelSelectionWidget(self)
-        self.connect(self.target_widget,
-                     SIGNAL("selection_changed(PyQt_PyObject, PyQt_PyObject)"),
-                     self.on_target_changed)
-        self.connect(self.target_widget,
-                     SIGNAL("label_activated(int)"),
-                     self.on_label_activated)
-        
-        box.layout().addWidget(self.target_widget)
-        
-        self.genesInColumnsCheck = OWGUI.checkBox(box, self, "genes_in_columns",
-                                    "Genes in columns", 
-                                    callback=[self.init_from_data, self.plot])
-
-        box = OWGUI.widgetBox(self.controlArea, "Settings")
-        OWGUI.hSlider(box, self, "graph.symbolSize", label="Symbol size:   ", minValue=2, maxValue=20, step=1, callback = self.graph.updateSymbolSize)
-        OWGUI.checkBox(box, self, "showXTitle", "X axis title", callback=self.setAxesTitles)
-        OWGUI.checkBox(box, self, "showYTitle", "Y axis title", callback=self.setAxesTitles)
-        
-        toolbar = ZoomSelectToolbar(self, self.controlArea, self.graph, buttons=[ZoomSelectToolbar.IconSelect, ZoomSelectToolbar.IconZoom, ZoomSelectToolbar.IconPan])
-        
-        top_layout = toolbar.layout()
-        top_layout.setDirection(QBoxLayout.TopToBottom)
-        button_layotu = QHBoxLayout()
-        top_layout.insertLayout(0, button_layotu)
-        
-        for i in range(1, top_layout.count()):
-            item = top_layout.itemAt(1)
-            top_layout.removeItem(item)
-            button_layotu.addItem(item)
-        
-        OWGUI.checkBox(toolbar, self, "graph.symetricSelections", "Symetric selection", callback=self.graph.reselect)
-
-        box = OWGUI.widgetBox(self.controlArea, "Commit")
-        b = OWGUI.button(box, self, "Commit", callback=self.commit, default=True)
-        cb = OWGUI.checkBox(box, self, "auto_commit", "Commit automatically")
-        OWGUI.setStopper(self, b, cb, "selection_changed_flag", self.commit_if)
-
-        self.connect(self.graphButton, SIGNAL("clicked()"), self.graph.saveToFile)
-        
-        OWGUI.rubber(self.controlArea)
+    def __init__(self, parent=None):
+        widget.OWWidget.__init__(self, parent)
 
         self.data = None
         self.target_group = None, []
+        self.targets = []
         self.current_selection = []
+        self.validindices = numpy.empty((0,), dtype=int)
 
-        self.graph.reselect(True)
-        self.resize(800, 600)
+        self.graph = VolcanoGraph(symbolSize=self.symbol_size, background="w")
+        self.graph.setSelectionCut(self.cut_log_r, self.cut_log_p)
+        self.graph.setSelectionMode(
+            VolcanoGraph.SymetricSelection if self.symetric_selections else
+            VolcanoGraph.RectSelection)
+
+        self.graph.selectionChanged.connect(self.on_selection_changed)
+        self.graph.scene().installEventFilter(self)
+        self.graph.getViewBox().setMouseEnabled(False, False)
+        self.graph.getViewBox().enableAutoRange(enable=True)
+        self.graph.getViewBox().setMenuEnabled(False)
+        self.graph.getPlotItem().hideButtons()
+        self.graph.plotItem.showGrid(True, True, 0.3)
+        self.mainArea.layout().addWidget(self.graph)
+
+        ## GUI
+        box = gui.widgetBox(self.controlArea, "Info")
+        self.infoLabel = gui.label(box, self, "")
+        self.infoLabel.setText("No data on input")
+        self.infoLabel2 = gui.label(box, self, "")
+        self.infoLabel2.setText("0 selected genes")
+
+        box = gui.widgetBox(self.controlArea, "Target Labels")
+
+        self.target_widget = guiutils.LabelSelectionWidget(
+            self,
+            groupChanged=self.on_label_activated,
+            groupSelectionChanged=self.on_target_changed)
+
+        box.layout().addWidget(self.target_widget)
+
+        box = gui.widgetBox(self.controlArea, "Selection")
+        cb = gui.checkBox(box, self, "symetric_selections", "Symmetric selection",
+                          callback=self.__on_selectionModeChanged)  # type: QCheckBox
+        form = QFormLayout(
+            labelAlignment=Qt.AlignRight,
+            formAlignment=Qt.AlignLeft,
+            fieldGrowthPolicy=QFormLayout.AllNonFixedFieldsGrow,
+        )
+
+        form.addRow(
+            "|log(ratio)|:",
+            gui.spin(box, self, "cut_log_r", 0.0, 20.0,
+                     step=0.01, decimals=4, spinType=float,
+                     callback=self.on_cut_changed)
+        )
+        form.addRow(
+            "-log<sub>10</sub>(P_value):",
+            gui.spin(box, self, "cut_log_p", 0.0, 20.0,
+                     step=0.01, decimals=4, spinType=float,
+                     callback=self.on_cut_changed)
+        )
+        box.layout().addLayout(form)
+
+        def set_enable_all(layout, enabled):
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item is not None and item.widget() is not None:
+                    item.widget().setEnabled(enabled)
+        set_enable_all(form, self.symetric_selections)
+        cb.toggled.connect(partial(set_enable_all, form))
+        box = gui.widgetBox(self.controlArea, "Settings")
+
+        gui.hSlider(box, self, "symbol_size", label="Symbol size:   ",
+                    minValue=2, maxValue=20, step=1,
+                    callback=lambda:
+                        self.graph.setSymbolSize(self.symbol_size))
+
+        gui.rubber(self.controlArea)
+        gui.auto_commit(self.controlArea, self, "auto_commit", "Commit")
+
+    def sizeHint(self):
+        return QSize(800, 600)
 
     def clear(self):
-        self.target_widget.set_labels([])
         self.targets = []
-        self.label_selections = []
-        self.target_group = None, []
+        self.stored_selections = []
+        self.target_widget.setModel(None)
+        self.validindices = numpy.empty((0,), dtype=int)
         self.clear_graph()
-        
-    def clear_graph(self):
-        self.values = {}
-        self.graph.setPlotValues({})
-        self.updateTooltips()
 
-    def setData(self, data=None):
-#         self.closeContext("")
-        self.closeContext("targets")
+    def clear_graph(self):
+        self.graph.clearPlot()
+
+    def set_data(self, data=None):
+        self.closeContext()
         self.clear()
         self.data = data
         self.error(0)
         self.warning([0, 1])
-        if data:
-            self.genes_in_columns = not bool(data.domain.classVar)
-            self.genesInColumnsCheck.setDisabled(not bool(data.domain.classVar))
-            if self.genes_in_columns:
-                self.genes_in_columns = not data_hints.get_hint(data, "genesinrows", not self.genes_in_columns)
-#             self.openContext("", data)
+        if data is not None:
+            self.init_from_data()
+
+            if not self.targets:
+                self.error(0, "Data has no suitable defined groups/labels")
+
+            genesinrows = data_hints.get_hint(data, "genesinrows", True)
+
+            # Select the first RowGroup if genesinrows hint is False
+            if not genesinrows:
+                ind = [i for i, grp in enumerate(self.targets)
+                       if isinstance(grp, grouputils.RowGroup)]
+                if ind:
+                    self.current_group_index = ind[0]
+                else:
+                    self.current_group_index = 0 if self.targets else -1
+
+            else:
+                self.current_group_index = 0
+
+            # TODO: Why does the current_group_index not get restored
+            self.openContext([(grp.name, v)
+                              for grp in self.targets for v in grp.values])
+            model = self.target_widget.model()
+
+            # FIX: This assumes fixed target key/values order.
+            indices = [model.index(i, 0, model.index(keyind, 0,))
+                       for keyind, selected in enumerate(self.stored_selections)
+                       for i in selected]
+
+            selection = guiutils.itemselection(indices)
+            self.target_widget.setCurrentGroupIndex(self.current_group_index)
+            self.target_widget.setSelection(selection)
+
+            self.plot()
         else:
             self.infoLabel.setText("No data on input.")
-        self.init_from_data()
+
+        self.unconditional_commit()
 
     def init_from_data(self):
-        """ Init widget state from the data.
+        """Initialize widget state after receiving new data.
         """
-        self.update_target_labels()
-        self.error(0)
-        if self.data:
-            if not self.targets:
-                if self.genes_in_columns:
-                    self.error(0, "Data set with no column labels (attribute tags)")
-                else:
-                    self.error(0, "Data has no class.")
-        
-        self.openContext("targets", [(label, v) for label, vals in self.targets \
-                                                for v in vals])
-        
-        if len(self.label_selections) != len(self.targets): # Some times this happens.
-            self.label_selections = [[] for t in self.targets]
-            
-        if self.target_group == (None, []) and self.targets:
-            label, values = self.targets[0]
-            self.target_group = (label, values[:1])
-            
-        if self.target_group != (None, []):
-            self.target_widget.set_selection(*self.target_group)
-        else:
-            self.clear_graph()
+        if self.data is not None:
+            column_groups, row_groups = grouputils.group_candidates(self.data)
+            self.targets = column_groups + row_groups
+            self.stored_selections = [[0] for _ in self.targets]
 
-    def update_target_labels(self):
-        if self.data:
-            if self.genes_in_columns:
-                items = [a.attributes.items() for a in self.data.domain.attributes]
-                items = reduce(add, items, [])
-                
-                targets = defaultdict(set)
-                for label, value in items:
-                    targets[label].add(value)
-                    
-                targets = [(key, list(sorted(vals))) for key, vals in targets.items() \
-                           if len(vals) >= 2]
-                self.targets = targets
-                
-            else:
-                var = self.data.domain.classVar
-                values = list(var.values)
-                if len(values) >= 2:
-                    self.targets = [(var.name, values)]
-                else:
-                    self.targets = []
+            targetitems = [guiutils.standarditem_from(desc)
+                           for desc in self.targets]
+            model = QStandardItemModel()
+            for item in targetitems:
+                model.appendRow(item)
+
+            with blocked_signals(self.target_widget):
+                self.target_widget.setModel(model)
+
         else:
             self.targets = []
-            
-        if self.targets:
-            label, values = self.targets[0]
-            self.target_group = (label, values[:1])
-        else:
-            self.target_group = None, []
-            
-        self.label_selections = [[] for t in self.targets]
-        self.target_widget.set_labels(self.targets)
-                
-        
+            self.stored_selections = []
+            with blocked_signals(self.target_widget):
+                self.target_widget.setModel(None)
+
+    def selected_split(self):
+        groupindex = self.target_widget.currentGroupIndex()
+        if not (0 <= groupindex < len(self.targets)):
+            return None, []
+        group = self.targets[groupindex]
+        selection = self.target_widget.currentGroupSelection()
+        selection = [ind.row() for ind in selection.indexes()]
+        return group, selection
+
     def on_label_activated(self, index):
-        """ Try to restore a saved selection.
-        """
-        selected = self.label_selections[index]
-        if not selected:
-            selected = self.targets[index][1][:1]
-            
-        self.target_widget.set_selection(index, selected)
-        
-    def on_target_changed(self, label, values):
-        self.target_group = label, values
-        # Save the selection
-        labels = [l for l, _ in self.targets]
-        if label in labels:
-            index = labels.index(label)
-            self.label_selections[index] = values
-            
-        # replot
-        if label and values:
+        self.current_group_index = index
+        self.plot()
+
+    def on_target_changed(self):
+        # Save the current selection to persistent settings
+        rootind = self.target_widget.currentGroupIndex()
+        selection = self.target_widget.currentGroupSelection()
+        indices = [ind.row() for ind in selection.indexes()]
+
+        if rootind != -1 and indices:
+            self.stored_selections[rootind] = indices
+
+        self._update_plot()
+
+    def on_cut_changed(self):
+        self.graph.setSelectionCut(self.cut_log_r, self.cut_log_p)
+
+    def _update_plot(self):
+        group, targetindices = self.selected_split()
+        if group is not None and targetindices:
             self.plot()
         else:
             self.clear_graph()
-    
-    @disable_controls
+
+    def __on_selectionModeChanged(self):
+        if self.symetric_selections:
+            self.graph.setSelectionMode(VolcanoGraph.SymetricSelection)
+        else:
+            self.graph.setSelectionMode(VolcanoGraph.RectSelection)
+
     def plot(self):
-        self.values = {}
+        self.graph.clearPlot()
+        self.validindices = numpy.empty((0,), dtype=int)
         self.current_selection = []
-        target_label, target_values = self.target_group
+        group, target_indices = self.selected_split()
         self.warning([0, 1])
         self.error(1)
-        if self.data and target_values:
-            target_label, target_values = self.target_group
-            if self.genes_in_columns:
-                target = set([(target_label, value) for value in target_values])
-            else:
-                target = set(target_values)
-            
-            ttest = obiExpression.ExpressionSignificance_TTest(self.data, useAttributeLabels=self.genes_in_columns)
-            ind1, ind2 = ttest.test_indices(target)
-            
-            if not len(ind1) or not len(ind2):
-                self.error(1, "Target labels most exclude/include at least one value.")
-                
-            if len(ind1) < 2 and len(ind2) < 2:
-                self.warning(0, "Insufficient data to compute statistics. More than one measurement per class should be provided")
-            
-            self.progressBarInit()
-            try:
-                tt = ttest(target)
-                self.progressBarSet(25)
-                fold = obiExpression.ExpressionSignificance_FoldChange(self.data, useAttributeLabels=self.genes_in_columns)(target)
-                self.progressBarSet(50)
-            except ZeroDivisionError, ex:
-                tt, fold = [], []
+
+        if self.data and group is not None and target_indices:
+            X = self.data.X
+            I1 = grouputils.group_selection_mask(
+                self.data, group, target_indices)
+            I2 = ~I1
+            if isinstance(group, grouputils.RowGroup):
+                X = X.T
+
+            N1, N2 = numpy.count_nonzero(I1), numpy.count_nonzero(I2)
+
+            if not N1 or not N2:
+                self.error(
+                    1, "Target labels most exclude/include at least one value."
+                )
+
+            if N1 < 2 and N2 < 2:
+                self.warning(
+                    0, "Insufficient data to compute statistics. "
+                       "More than one measurement per class should be provided"
+                )
+
+            X1, X2 = X[:, I1], X[:, I2]
+            if numpy.any(X1 < 0.0) or numpy.any(X2 < 0):
+                self.error(
+                    "Negative values in the input. The inputs cannot be in "
+                    "ratio scale."
+                )
+                X1 = numpy.full_like(X1, numpy.nan)
+                X2 = numpy.full_like(X2, numpy.nan)
+
+            with numpy.errstate(divide="ignore", invalid="ignore"):
+                fold = numpy.log2(numpy.mean(X1, axis=1) /
+                                  numpy.mean(X2, axis=1))
+                # TODO: handle missing values better (mstats)
+                _, P = scipy.stats.ttest_ind(X1, X2, axis=1, equal_var=True)
+                logP = numpy.log10(P)
+                if numpy.isscalar(logP):
+                    # ttest_ind does not preserve output shape if either
+                    # a or b is empty
+                    logP = numpy.full(fold.shape, numpy.nan)
+
+            mask = numpy.isfinite(fold) & numpy.isfinite(logP)
+            self.validindices = numpy.flatnonzero(mask)
+            self.graph.setPlotData(numpy.array([fold[mask], -logP[mask]]).T)
+
             self.infoLabel.setText("%i genes on input" % len(fold))
-            
-            invalid = set([key for (key, (t, p)), (_, f) in zip(tt, fold) if any(v is numpy.ma.masked for v in [t, p, f]) or f==0.0])
-            tt = [t for t in tt if t[0] not in invalid]
-            fold = [f for f in fold if f[0] not in invalid]
-            self.progressBarSet(75)
-            logratio = numpy.log2(numpy.abs([v for k, v in fold]))
-            logpval = -numpy.log10([p for k, (t, p) in tt])
-            self.values = dict(zip([k for k, v in tt], zip(logratio, logpval)))
-            if not self.values:
+            # ("{displayed} displayed, {undef} with undefined ratio "
+            #  "or t-statistics.")
+
+            if not len(numpy.flatnonzero(mask)):
                 self.warning(1, "Could not compute statistics for any genes!")
-            self.progressBarFinished()
-        self.graph.setPlotValues(self.values)
-        self.setAxesTitles()
-        self.updateTooltips()
 
-    def setAxesTitles(self):
-        self.graph.setAxisTitle(QwtPlot.xBottom, "log<sub>2</sub> (ratio)" if self.showXTitle else "")
-        self.graph.setAxisTitle(QwtPlot.yLeft, "-log<sub>10</sub> (p_value)" if self.showYTitle else "")
-
-    def updateTooltips(self):
-        self.graph.tips.removeAll()
-        for key, (logratio, logpval) in self.values.items():
-            self.graph.tips.addToolTip(logratio, logpval, "<b>%s</b><hr>log<sub>2</sub>(ratio): %.5f<br>p-value: %.5f" \
-                                       %(str(key) if self.genes_in_columns else key.name, logratio, math.pow(10, -logpval)))
-
-    def selection(self, items=None):
+    def selection(self):
         """
-        Return the current selection.
+        Return the current item selection mask.
         """
-        if items is None:
-            items = sorted(self.values.items())
-        values = [val for key, val in items]
-        test = self.graph.selection.testSelection(values)
-        return test
+        mask = self.graph.selectionMask()
+        return self.validindices[mask]
 
     def on_selection_changed(self):
         # Selection area on the plot has changed.
-        nselected = self.graph.selectedCurve.data().size()
-        self.infoLabel2.setText("%i selected genes" % nselected)
+        if self.graph.selectionMode() == VolcanoGraph.SymetricSelection:
+            self.cut_log_r, self.cut_log_p = self.graph.selectionCut()
 
-        if self.auto_commit:
+        if self.data is not None:
+            mask = self.graph.selectionMask()
+            nselected = numpy.count_nonzero(mask)
+            self.infoLabel2.setText("%i selected genes" % nselected)
+
             selection = list(self.selection())
             # Did the selection actually change
             if selection != self.current_selection:
                 self.current_selection = selection
                 self.commit()
-        else:
-            self.selection_changed_flag = True
-    
+
     def commit(self):
-        if self.data and self.genes_in_columns:
-            items = sorted(self.values.items())
-            test = self.selection(items)
-            selected = [self.data[i] for t, (i, value) in zip(test, items) if t]
-            if selected:
-                data = orange.ExampleTable(self.data.domain, selected)
+        """
+        Commit (send) the selected items.
+        """
+        if self.data is not None and \
+                isinstance(self.selected_split()[0], grouputils.ColumnGroup):
+            selected = self.selection()
+            if selected.size:
+                data = self.data[selected]
             else:
                 data = None
-            self.current_selection = list(test) # For testing in on_selection_changed
-        elif self.data:
-            attrs = [(attr, self.values[attr])  for attr in self.data.domain.attributes if attr in self.values]
-            test = self.selection(attrs)
-#            test = self.graph.selection.testSelection([val for attr, val in attrs])
-            selected = [attr for t, (attr, val) in zip(test, attrs) if t]
-            newdomain = orange.Domain(selected + [self.data.domain.classVar])
-            newdomain.addmetas(self.data.domain.getmetas())
-            data = orange.ExampleTable(newdomain, self.data)
-            self.current_selection = list(test) # For testing in on_selection_changed
+            self.current_selection = list(selected)  # For testing in on_selection_changed
+        elif self.data is not None:
+            selected = self.selection()
+            attrs = [self.data.domain[i] for i in selected]
+            domain = Orange.data.Domain(
+                attrs, self.data.domain.class_vars, self.data.domain.metas)
+            data = self.data.from_table(domain, self.data)
+            self.current_selection = list(selected)  # For testing in on_selection_changed
         else:
             data = None
-        
-        self.send("Examples with selected attributes", data)
-        self.selection_changed_flag = False
 
-    def commit_if(self):
-        if self.auto_commit:
-            self.commit()
+        self.send("Data subset", data)
+
+    def _handleHelpEvent(self, event):
+        # Handle a help event for the plot
+        viewbox = self.graph.getViewBox()
+        pos = viewbox.mapToView(viewbox.mapFromScene(event.scenePos()))
+        logr = pos.x()
+        logp = pos.y()
+        text = ""
+        points = []
+        if self.graph._item is not None:
+            points = self.graph._item.pointsAt(pos)
+        if points:
+            point = points[0]
+            pos = point.pos()
+            logr, logp = pos.x(), pos.y()
+            index = point.data()
+
+            text = ("<b>{index}</b><hr/>"
+                    "log<sub>2</sub>(ratio): {logr:.5f}<br/>"
+                    "p-value: {p:.5f}").format(logr=logr, p=10 ** -logp,
+                                               index=index)
+
+            if len(points) > 1:
+                text += "<br/>... (and {} not shown)".format(len(points) - 1)
         else:
-            self.selection_changed_flag = True
-            
-    def settingsToWidgetCallbacktargets(self, handler, context):
-        self.label_selections = list(getattr(context, "label_selections", self.label_selections))
-        self.target_group = getattr(context, "target_group", self.target_group)
-        
-    def settingsFromWidgetCallbacktargets(self, handler, context):
-        context.label_selections = list(self.label_selections)
-        context.target_group = self.target_group
+            text = ""
+
+        QToolTip.showText(event.screenPos(), text, widget=self.graph)
+        return True
+
+    def eventFilter(self, obj, event):
+        if obj is self.graph.scene():
+            if event.type() == QEvent.GraphicsSceneHelp:
+                return self._handleHelpEvent(event)
+        return super().eventFilter(obj, event)
+
+    def send_report(self):
+        group, selection = self.selected_split()
+        self.report_plot()
+        caption = []
+        if group:
+            target = group.name
+            values = ", ".join(numpy.array(group.values)[selection])
+            caption.append("{var} = {value}".format(var=target, value=values))
+        caption.append(self.infoLabel2.text())
+        self.report_caption(", ".join(caption))
+
+
+def main(argv=None):
+    from AnyQt.QtWidgets import QApplication
+    app = QApplication(list(argv) if argv else [])
+    argv = app.arguments()
+    w = OWVolcanoPlot()
+
+    if len(argv) > 1:
+        filename = argv[1]
+    else:
+        filename = "geo-gds360"
+    d = Orange.data.Table(filename)
+    w.set_data(d)
+    w.handleNewSignals()
+    w.show()
+    w.raise_()
+    rval = app.exec_()
+    w.set_data(None)
+    w.handleNewSignals()
+    w.saveSettings()
+    w.onDeleteWidget()
+    return rval
 
 
 if __name__ == "__main__":
-    ap = QApplication(sys.argv)
-    w = OWVulcanoPlot()
-    d = orange.ExampleTable("brown-selected.tab")
-    w.setData(d)
-    w.show()
-    ap.exec_()
-    w.saveSettings()
+    sys.exit(main(sys.argv))

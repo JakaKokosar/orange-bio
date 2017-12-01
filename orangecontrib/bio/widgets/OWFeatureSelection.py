@@ -1,752 +1,1355 @@
+# -*- coding: utf-8 -*-
 """
-<name>Differential expression</name>
-<description>Gene differential expression scoring and selection.</description>
-<priority>1010</priority>
-<icon>icons/GeneSelection.svg</icon>
+Differential Gene Expression
+----------------------------
+
 """
-
-from __future__ import absolute_import, with_statement
-
-from collections import defaultdict
-from functools import wraps
-from operator import add
+import sys
+from types import SimpleNamespace as namespace
 
 import numpy as np
-import numpy.ma as ma
+import pyqtgraph as pg
+import scipy.special
+import scipy.stats
+from AnyQt.QtCore import Qt, QLineF, QSize, QRectF, Signal, Slot
+from AnyQt.QtGui import QStandardItemModel, QPen
+from orangecontrib.bio.widgets.utils.settings import SetContextHandler
 
-import orange
-from Orange.OrangeWidgets import OWGUI
-from Orange.OrangeWidgets.OWGraph import *
-from Orange.OrangeWidgets.OWGraphTools import PolygonCurve
-from Orange.OrangeWidgets.OWHist import OWInteractiveHist
-from Orange.OrangeWidgets.OWToolbars import ZoomSelectToolbar
-from Orange.OrangeWidgets.OWWidget import *
-
-from ..obiExpression import *
-
-
-NAME = "Differential Expression"
-DESCRIPTION = "Gene selection by differential expression analysis."
-ICON = "icons/GeneSelection.svg"
-PRIORITY = 1010
-
-INPUTS = [("Examples", Orange.data.Table, "set_data")]
-OUTPUTS = [("Example table with selected genes", Orange.data.Table, Default),
-           ("Example table with remaining genes", Orange.data.Table),
-           ("Selected genes", Orange.data.Table)]
-
-REPLACES = ["_bioinformatics.widgets.OWFeatureSelection.OWFeatureSelection"]
+import Orange.data
+from Orange.canvas.report import report
+from Orange.preprocess import transformation
+from Orange.widgets import widget, gui, settings
+from Orange.widgets.utils import concurrent
+from Orange.widgets.utils.datacaching import data_hints
+from orangecontrib.bio.widgets.utils import gui as guiutils
+from orangecontrib.bio.widgets.utils import group as grouputils
 
 
-class ExpressionSignificance_TTest_PValue(ExpressionSignificance_TTest):
-    def __call__(self, *args, **kwargs):
-        return [(key, pval) for key, (t, pval) in \
-                ExpressionSignificance_TTest.__call__(self, *args, **kwargs)]
-
-
-class ExpressionSignificance_TTest_T(ExpressionSignificance_TTest):
-    def __call__(self, *args, **kwargs):
-        return [(key, t) for key, (t, pval) in \
-                ExpressionSignificance_TTest.__call__(self, *args, **kwargs)]
-
-
-class ExpressionSignificance_ANOVA_PValue(ExpressionSignificance_ANOVA):
-    def __call__(self, *args, **kwargs):
-        return [(key, pval) for key, (t, pval) in \
-                ExpressionSignificance_ANOVA.__call__(self, *args, **kwargs)]
-
-
-class ExpressionSignificance_ANOVA_F(ExpressionSignificance_ANOVA):
-    def __call__(self, *args, **kwargs):
-        return [(key, f) for key, (f, pval) in \
-                ExpressionSignificance_ANOVA.__call__(self, *args, **kwargs)]
-
-
-class ExpressionSignificance_Log2FoldChange(ExpressionSignificance_FoldChange):
-    def __call__(self, *args, **kwargs):
-        return [(key, math.log(fold, 2.0) if fold > 1e-300 and fold < 1e300 else 0.0) \
-                for key, fold in ExpressionSignificance_FoldChange.__call__(self, *args, **kwargs)]
-
-
-class ExpressionSignigicance_MannWhitneyu_U(ExpressionSignificance_MannWhitneyu):
-    def __call__(self, *args, **kwargs):
-        return [(key, u) for key, (u, p_val) in \
-                ExpressionSignificance_MannWhitneyu.__call__(self, *args, **kwargs)]
-
-
-class ScoreHist(OWInteractiveHist):
-    def __init__(self, master, parent=None, type="hiTail"):
-        OWInteractiveHist.__init__(self, parent, type=type)
-        self.master = master
-        self.setAxisTitle(QwtPlot.xBottom, "Score")
-        self.setAxisTitle(QwtPlot.yLeft, "Frequency")
-        self.activateSelection()
-
-    def setBoundary(self, low, hi):
-        OWInteractiveHist.setBoundary(self, low, hi)
-        self.master.on_boundary_change(low, hi)
-
-
-def disable_controls(method):
-    """ Disable the widget's control area during the duration of this call.
+def score_fold_change(a, b, axis=0):
     """
-    @wraps(method)
-    def f(self, *args, **kwargs):
-        self.controlArea.setDisabled(True)
-        qApp.processEvents()
-        try:
-            return method(self, *args, **kwargs)
-        finally:
-            self.controlArea.setDisabled(False)
-    return f
+    Calculate the fold change between `a` and `b` samples.
 
-from Orange.orng.orngDataCaching import data_hints
+    Parameters
+    ----------
+    a, b : array
+        Arrays containing the samples
+    axis : int
+        Axis over which to compute the FC
 
-from .OWGenotypeDistances import SetContextHandler
-from .OWVulcanoPlot import LabelSelectionWidget
+    Returns
+    -------
+    FC : array
+        The FC scores
+    """
+    mean_a = np.nanmean(a, axis=axis)
+    mean_b = np.nanmean(b, axis=axis)
+    res = mean_a / mean_b
+    warning = None
+    if np.any(res < 0):
+        res[res < 0] = float("nan")
+        warning = "Negative fold change scores were ignored. You should use another scoring method."
+    return res, warning
 
 
-class OWFeatureSelection(OWWidget):
-    settingsList = [
-        "method_index", "dataLabelIndex", "compute_null",
-        "permutations_count", "selectPValue", "auto_commit",
-        "thresholds"]
+def score_log_fold_change(a, b, axis=0):
+    """
+    Return the log2(FC).
 
-    contextHandlers = {
-        "Data": DomainContextHandler("Data", ["genes_in_columns"]),
-        "TargetSelection":
-            SetContextHandler("TargetSelection", findImperfect=False)
-    }
+    See Also
+    --------
+    score_fold_change
 
-    def __init__(self, parent=None, signalManager=None, name="Gene selection"):
-        OWWidget.__init__(self, parent, signalManager, name, wantGraph=True, showSaveGraph=True)
-        self.inputs = [("Examples", ExampleTable, self.set_data)]
-        self.outputs = [("Example table with selected genes", ExampleTable), ("Example table with remaining genes", ExampleTable), ("Selected genes", ExampleTable)]
+    """
+    s, w = score_fold_change(a, b, axis=axis) 
+    return np.log2(s), w
 
-        self.method_index = 0
-        self.genes_in_columns = False
-        self.compute_null = False
-        self.permutations_count = 10
-        self.auto_commit = False
-        self.selectNBest = 20
-        self.selectPValue = 0.01
-        self.data_changed_flag = False
-        self.add_scores_to_output = True
-        self.thresholds = {
-            "fold change": (0.5, 2.),
-            "log2 fold change": (-1, 1),
-            "t-test": (-2, 2),
-            "t-test p-value": (0.01, 0.01),
+
+def score_ttest(a, b, axis=0):
+    T, P = scipy.stats.ttest_ind(a, b, axis=axis)
+    return T, P
+
+
+def score_ttest_t(a, b, axis=0):
+    T, _ = score_ttest(a, b, axis=axis)
+    return T
+
+
+def score_ttest_p(a, b, axis=0):
+    _, P = score_ttest(a, b, axis=axis)
+    return P
+
+
+def score_anova(*arrays, axis=0):
+    F, P = f_oneway(*arrays, axis=axis)
+    return F, P
+
+
+def score_anova_(*arrays, axis=0):
+    arrays = [np.asarray(arr, dtype=float) for arr in arrays]
+
+    if not len(arrays) > 1:
+        raise TypeError("Need at least 2 positional arguments")
+
+    if not 0 <= axis < 2:
+        raise ValueError("0 <= axis < 2")
+
+    if not all(arrays[i].ndim == arrays[i + 1].ndim
+               for i in range(len(arrays) - 2)):
+        raise ValueError("All arrays must have the same number of dimensions")
+
+    if axis >= arrays[0].ndim:
+        raise ValueError()
+
+    if axis == 0:
+        arrays = [arr.T for arr in arrays]
+
+    scores = [scipy.stats.f_oneway(*ars) for ars in zip(*arrays)]
+    F, P = zip(*scores)
+    return np.array(F, dtype=float), np.array(P, dtype=float)
+
+
+def f_oneway(*arrays, axis=0):
+    """
+    Perform a 1-way ANOVA
+
+    Like `scipy.stats.f_oneway` but accept 2D arrays, with `axis`
+    specifying over which axis to operate (in which axis the samples
+    are stored).
+
+    Parameters
+    ----------
+    A1, A2, ... : array_like
+        The samples for each group.
+    axis : int
+        The axis which contain the samples.
+
+    Returns
+    -------
+    F : array
+        F scores
+    P : array
+        P values
+
+    See also
+    --------
+    scipy.stats.f_oneway
+    """
+    arrays = [np.asarray(a, dtype=float) for a in arrays]
+    alldata = np.concatenate(arrays, axis)
+    bign = alldata.shape[axis]
+    sstot = np.sum(alldata ** 2, axis) - (np.sum(alldata, axis) ** 2) / bign
+
+    ssarrays = [(np.sum(a, axis, keepdims=True) ** 2) / a.shape[axis]
+                for a in arrays]
+    ssbn = np.sum(np.concatenate(ssarrays, axis), axis)
+    ssbn -= (np.sum(alldata, axis) ** 2) / bign
+    assert sstot.shape == ssbn.shape
+
+    sswn = sstot - ssbn
+    dfbn = len(arrays) - 1
+    dfwn = bign - len(arrays)
+    msb = ssbn / dfbn
+    msw = sswn / dfwn
+    f = msb / msw
+    prob = scipy.special.fdtrc(dfbn, dfwn, f)
+    return f, prob
+
+
+def score_anova_f(*arrays, axis=0):
+    F, _ = score_anova(*arrays, axis=axis)
+    return F
+
+
+def score_anova_p(*arrays, axis=0):
+    _, P = score_anova(*arrays, axis=axis)
+    return P
+
+
+def score_signal_to_noise(a, b, axis=0):
+    mean_a = np.nanmean(a, axis=axis)
+    mean_b = np.nanmean(b, axis=axis)
+
+    std_a = np.nanstd(a, axis=axis, ddof=1)
+    std_b = np.nanstd(b, axis=axis, ddof=1)
+
+    return (mean_a - mean_b) / (std_a + std_b)
+
+
+def score_mann_whitney(a, b, axis=0):
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+
+    if not 0 <= axis < 2:
+        raise ValueError("Axis")
+
+    if a.ndim != b.ndim:
+        raise ValueError
+
+    if axis >= a.ndim:
+        raise ValueError
+
+    if axis == 0:
+        a, b = a.T, b.T
+
+    res = [scipy.stats.mannwhitneyu(a_, b_) for a_, b_ in zip(a, b)]
+    U, P = zip(*res)
+    return np.array(U), np.array(P)
+
+
+def score_mann_whitney_u(a, b, axis=0):
+    U, _ = score_mann_whitney(a, b, axis=axis)
+    return U
+
+
+class InfiniteLine(pg.InfiniteLine):
+    def paint(self, painter, option, widget=None):
+        brect = self.boundingRect()
+        c = brect.center()
+        line = QLineF(brect.left(), c.y(), brect.right(), c.y())
+        t = painter.transform()
+        line = t.map(line)
+        painter.save()
+        painter.resetTransform()
+        painter.setPen(self.currentPen)
+        painter.drawLine(line)
+        painter.restore()
+
+
+class Histogram(pg.PlotWidget):
+    """
+    A histogram plot with interactive 'tail' selection
+    """
+    #: Emitted when the selection boundary has changed
+    selectionChanged = Signal()
+    #: Emitted when the selection boundary has been edited by the user
+    #: (by dragging the boundary lines)
+    selectionEdited = Signal()
+
+    #: Selection mode
+    NoSelection, Low, High, TwoSided, Middle = 0, 1, 2, 3, 4
+
+    def __init__(self, parent=None, **kwargs):
+        pg.PlotWidget.__init__(self, parent, **kwargs)
+
+        self.getAxis("bottom").setLabel("Score")
+        self.getAxis("left").setLabel("Counts")
+
+        self.__data = None
+        self.__histcurve = None
+
+        self.__mode = Histogram.NoSelection
+        self.__min = 0
+        self.__max = 0
+
+        def makeline(pos):
+            pen = QPen(Qt.darkGray, 1)
+            pen.setCosmetic(True)
+            line = InfiniteLine(angle=90, pos=pos, pen=pen, movable=True)
+            line.setCursor(Qt.SizeHorCursor)
+            return line
+
+        self.__cuthigh = makeline(self.__max)
+        self.__cuthigh.sigPositionChanged.connect(self.__on_cuthigh_changed)
+        self.__cuthigh.sigPositionChangeFinished.connect(self.selectionEdited)
+        self.__cutlow = makeline(self.__min)
+        self.__cutlow.sigPositionChanged.connect(self.__on_cutlow_changed)
+        self.__cutlow.sigPositionChangeFinished.connect(self.selectionEdited)
+
+        brush = pg.mkBrush((200, 200, 200, 180))
+        self.__taillow = pg.PlotCurveItem(
+            fillLevel=0, brush=brush, pen=QPen(Qt.NoPen))
+        self.__taillow.setVisible(False)
+
+        self.__tailhigh = pg.PlotCurveItem(
+            fillLevel=0, brush=brush, pen=QPen(Qt.NoPen))
+        self.__tailhigh.setVisible(False)
+
+    def setData(self, hist, bins=None):
+        """
+        Set the histogram data
+        """
+        if bins is None:
+            bins = np.arange(len(hist))
+
+        self.__data = (hist, bins)
+        if self.__histcurve is None:
+            self.__histcurve = pg.PlotCurveItem(
+                x=bins, y=hist, stepMode=True
+            )
+        else:
+            self.__histcurve.setData(x=bins, y=hist, stepMode=True)
+
+        self.__update()
+
+    def setHistogramCurve(self, curveitem):
+        """
+        Set the histogram plot curve.
+        """
+        if self.__histcurve is curveitem:
+            return
+
+        if self.__histcurve is not None:
+            self.removeItem(self.__histcurve)
+            self.__histcurve = None
+            self.__data = None
+
+        if curveitem is not None:
+            if not curveitem.opts["stepMode"]:
+                raise ValueError("The curve must have `stepMode == True`")
+            self.addItem(curveitem)
+            self.__histcurve = curveitem
+            self.__data = (curveitem.yData, curveitem.xData)
+
+        self.__update()
+
+    def histogramCurve(self):
+        """
+        Return the histogram plot curve.
+        """
+        return self.__histcurve
+
+    def setSelectionMode(self, mode):
+        """
+        Set selection mode
+        """
+        if self.__mode != mode:
+            self.__mode = mode
+            self.__update_cutlines()
+            self.__update_tails()
+
+    def setLower(self, value):
+        """
+        Set the lower boundary value.
+        """
+        if self.__min != value:
+            self.__min = value
+            self.__update_cutlines()
+            self.__update_tails()
+            self.selectionChanged.emit()
+
+    def setUpper(self, value):
+        """
+        Set the upper boundary value.
+        """
+        if self.__max != value:
+            self.__max = value
+            self.__update_cutlines()
+            self.__update_tails()
+            self.selectionChanged.emit()
+
+    def setBoundary(self, lower, upper):
+        """
+        Set lower and upper boundary value.
+        """
+        changed = False
+        if self.__min != lower:
+            self.__min = lower
+            changed = True
+
+        if self.__max != upper:
+            self.__max = upper
+            changed = True
+
+        if changed:
+            self.__update_cutlines()
+            self.__update_tails()
+            self.selectionChanged.emit()
+
+    def boundary(self):
+        """
+        Return the lower and upper boundary values.
+        """
+        return (self.__min, self.__max)
+
+    def clear(self):
+        """
+        Clear the plot.
+        """
+        self.__data = None
+        self.__histcurve = None
+        super().clear()
+
+    def __update(self):
+        def additem(item):
+            if item.scene() is not self.scene():
+                self.addItem(item)
+
+        def removeitem(item):
+            if item.scene() is self.scene():
+                self.removeItem(item)
+
+        if self.__data is not None:
+            additem(self.__cuthigh)
+            additem(self.__cutlow)
+            additem(self.__tailhigh)
+            additem(self.__taillow)
+
+            _, edges = self.__data
+            # Update the allowable cutoff line bounds
+            minx, maxx = np.min(edges), np.max(edges)
+            span = maxx - minx
+            bounds = minx - span * 0.005, maxx + span * 0.005
+
+            self.__cuthigh.setBounds(bounds)
+            self.__cutlow.setBounds(bounds)
+
+            self.__update_cutlines()
+            self.__update_tails()
+        else:
+            removeitem(self.__cuthigh)
+            removeitem(self.__cutlow)
+            removeitem(self.__tailhigh)
+            removeitem(self.__taillow)
+
+    def __update_cutlines(self):
+        self.__cuthigh.setVisible(self.__mode & Histogram.High)
+        self.__cuthigh.setValue(self.__max)
+        self.__cutlow.setVisible(self.__mode & Histogram.Low)
+        self.__cutlow.setValue(self.__min)
+
+    def __update_tails(self):
+        if self.__mode == Histogram.NoSelection:
+            return
+        if self.__data is None:
+            return
+
+        hist, edges = self.__data
+
+        self.__taillow.setVisible(self.__mode & Histogram.Low)
+        if self.__min > edges[0]:
+            datalow = histogram_cut(hist, edges, edges[0], self.__min)
+            self.__taillow.setData(*datalow, fillLevel=0, stepMode=True)
+        else:
+            self.__taillow.clear()
+
+        self.__tailhigh.setVisible(self.__mode & Histogram.High)
+        if self.__max < edges[-1]:
+            datahigh = histogram_cut(hist, edges, self.__max, edges[-1])
+            self.__tailhigh.setData(*datahigh, fillLevel=0, stepMode=True)
+        else:
+            self.__tailhigh.clear()
+
+    def __on_cuthigh_changed(self):
+        self.setUpper(self.__cuthigh.value())
+
+    def __on_cutlow_changed(self):
+        self.setLower(self.__cutlow.value())
+
+
+def histogram_cut(hist, bins, low, high):
+    """
+    Return a subset of a histogram between low and high values.
+
+    Parameters
+    ----------
+    hist : (N, ) array
+        The histogram values/counts for each bin.
+    bins : (N + 1) array
+        The histogram bin edges.
+    low, high : float
+        The lower and upper edge where to cut the histogram
+
+    Returns
+    -------
+    histsubset : (M, ) array
+        The histogram subset
+    binssubset : (M + 1) array
+        New histogram bins. The first and the last value are equal
+        to `low` and `high` respectively.
+
+    Note that in general the first and the final bin widths are
+    different then the widths in the input bins
+
+    """
+    if len(bins) < 2:
+        raise ValueError()
+
+    if low >= high:
+        raise ValueError()
+
+    low = max(bins[0], low)
+    high = min(bins[-1], high)
+
+    if low <= bins[0]:
+        lowidx = 0
+    else:
+        lowidx = np.searchsorted(bins, low, side="left")
+
+    if high >= bins[-1]:
+        highidx = len(bins)
+    else:
+        highidx = np.searchsorted(bins, high, side="right")
+
+    cbins = bins[lowidx: highidx]
+    chist = hist[lowidx: highidx - 1]
+
+    if cbins[0] > low:
+        cbins = np.r_[low, cbins]
+        chist = np.r_[hist[lowidx - 1], chist]
+
+    if cbins[-1] < high:
+        cbins = np.r_[cbins, high]
+        chist = np.r_[chist, hist[highidx - 1]]
+
+    assert cbins.size == chist.size + 1
+    return cbins, chist
+
+
+def test_low(array, low, high):
+    return array <= low
+
+
+def test_high(array, low, high):
+    return array >= high
+
+
+def test_two_tail(array, low, high):
+    return (array >= high) | (array <= low)
+
+
+def test_middle(array, low, high):
+    return (array <= high) | (array >= low)
+
+
+class OWFeatureSelection(widget.OWWidget):
+    name = "Differential Expression"
+    description = "Gene selection by differential expression analysis."
+    icon = "../widgets/icons/GeneSelection.svg"
+    priority = 1010
+
+    inputs = [("Data", Orange.data.Table, "set_data")]
+    outputs = [("Data subset", Orange.data.Table, widget.Default),
+               ("Remaining data subset", Orange.data.Table),
+               ("Selected genes", Orange.data.Table)]
+
+    #: Selection types
+    LowTail, HighTail, TwoTail = 1, 2, 3
+    #: Test type - i.e a two sample (t-test, ...) or multi-sample (ANOVA) test
+    TwoSampleTest, VarSampleTest = 1, 2
+    #: Available scoring methods
+
+    Scores = [
+        ("Fold Change", TwoTail, TwoSampleTest, score_fold_change),
+        ("log2(Fold Change)", TwoTail, TwoSampleTest, score_log_fold_change),
+        ("T-test", TwoTail, TwoSampleTest, score_ttest_t),
+        ("T-test P-value", LowTail, TwoSampleTest, score_ttest_p),
+        ("ANOVA", HighTail, VarSampleTest, score_anova_f),
+        ("ANOVA P-value", LowTail, VarSampleTest, score_anova_p),
+        ("Signal to Noise Ratio", TwoTail, TwoSampleTest,
+         score_signal_to_noise),
+        ("Mann-Whitney", LowTail, TwoSampleTest, score_mann_whitney_u),
+    ]
+
+    settingsHandler = SetContextHandler()
+
+    #: Selected score index.
+    score_index = settings.Setting(0)
+    #: Compute the null score distribution (label permutations).
+    compute_null = settings.Setting(False)
+    #: Number of permutations to for null score distribution.
+    permutations_count = settings.Setting(20)
+    #: Alpha value (significance) for the selection on background
+    #: null score distribution.
+    alpha_value = settings.Setting(0.01)
+    #: N best for the fixed best N scores selection.
+    n_best = settings.Setting(20)
+
+    #: Stored thresholds for scores.
+    thresholds = settings.Setting({
+        "Fold Change": (0.5, 2.),
+        "log2(Fold Change)": (-1, 1),
+        "T-test": (-2, 2),
+        "T-test P-value": (0.01, 0.01),
+        "ANOVA": (0, 3),
+        "ANOVA P-value": (0, 0.01),
+    })
+
+    add_scores_to_output = settings.Setting(False)
+    auto_commit = settings.Setting(False)
+
+    #: Current target group index
+    current_group_index = settings.ContextSetting(-1)
+    #: Stored (persistent) values selection for all target split groups.
+    stored_selections = settings.ContextSetting([])
+
+    graph_name = 'histogram.plotItem'
+
+    def __init__(self, parent=None):
+        widget.OWWidget.__init__(self, parent)
+
+        self.min_value, self.max_value = \
+            self.thresholds.get(self.Scores[self.score_index][0], (1, 0))
+
+        #: Input data set
+        self.data = None
+        #: Current target group selection
+        self.targets = []
+        #: The computed scores
+        self.scores = None
+        #: The computed scores from label permutations
+        self.nulldist = None
+
+        self.__scores_future = self.__scores_state = None
+
+        self.__in_progress = False
+
+        self.test_f = {
+            OWFeatureSelection.LowTail: test_low,
+            OWFeatureSelection.HighTail: test_high,
+            OWFeatureSelection.TwoTail: test_two_tail,
         }
 
-        self.oneTailTestHi = oneTailTestHi = lambda array, low, hi: array >= hi
-        self.oneTailTestLow = oneTailTestLow = lambda array, low, hi: array <= low
-        self.twoTailTest = twoTailTest = lambda array, low, hi: (array >= hi) | (array <= low)
-        self.middleTest = middleTest = lambda array, low, hi: (array <= hi) | (array >= low)
-        
-        self.histType = {oneTailTestHi:"hiTail", oneTailTestLow:"lowTail", twoTailTest:"twoTail", middleTest:"middle"}
+        self.histogram = Histogram(
+            enableMouse=False, enableMenu=False, background="w"
+        )
+        self.histogram.enableAutoRange(enable=False)
+        self.histogram.getPlotItem().hideButtons()  # hide auto range button
+        self.histogram.getViewBox().setMouseEnabled(False, False)
+        self.histogram.selectionChanged.connect(
+            self.__on_histogram_plot_selection_changed
+        )
+        self.histogram.selectionEdited.connect(
+            self._invalidate_selection
+        )
 
-        # [(name, func, tail test, two sample test), ...]
-        self.score_methods = [("fold change", ExpressionSignificance_FoldChange, twoTailTest, True),
-                             ("log2 fold change", ExpressionSignificance_Log2FoldChange, twoTailTest, True),
-                             ("t-test", ExpressionSignificance_TTest_T, twoTailTest, True),
-                             ("t-test p-value", ExpressionSignificance_TTest_PValue, oneTailTestLow, True),
-                             ("anova", ExpressionSignificance_ANOVA_F, oneTailTestHi, False),
-                             ("anova p-value", ExpressionSignificance_ANOVA_PValue, oneTailTestLow, False),
-                             ("signal to noise ratio", ExpressionSignificance_SignalToNoise, twoTailTest, True),
-                             ("info gain", ExpressionSignificance_Info, oneTailTestHi, True),
-                             ("chi-square", ExpressionSignificance_ChiSquare, oneTailTestHi, True),
-                             ("mann-whitney", ExpressionSignigicance_MannWhitneyu_U, oneTailTestLow, True)]
+        self.mainArea.layout().addWidget(self.histogram)
 
-        boxHistogram = OWGUI.widgetBox(self.mainArea)
-        self.histogram = ScoreHist(self, boxHistogram)
-        boxHistogram.layout().addWidget(self.histogram)
-        self.histogram.show()
-        
-        box = OWGUI.widgetBox(self.controlArea, "Info")
-        self.dataInfoLabel = OWGUI.widgetLabel(box, "\n\n")
+        box = gui.widgetBox(self.controlArea, "Info")
+
+        self.dataInfoLabel = gui.widgetLabel(box, "No data on input.\n")
         self.dataInfoLabel.setWordWrap(True)
-        self.selectedInfoLabel = OWGUI.widgetLabel(box, "")
+        self.selectedInfoLabel = gui.widgetLabel(box, "\n")
 
-        box1 = OWGUI.widgetBox(self.controlArea, "Scoring Method")
-        self.testRadioBox = OWGUI.comboBox(box1, self, "method_index",
-                                    items=[sm[0] for sm in self.score_methods],
-                                    callback=[self.on_scoring_method_changed, self.update_scores])
-        
-        box = OWGUI.widgetBox(self.controlArea, "Target Labels")
-        self.label_selection_widget = LabelSelectionWidget(self)
+        box1 = gui.widgetBox(self.controlArea, "Scoring Method")
+        gui.comboBox(box1, self, "score_index",
+                     items=[sm[0] for sm in self.Scores],
+                     callback=[self.on_scoring_method_changed,
+                               self.update_scores])
+
+        box = gui.widgetBox(self.controlArea, "Target Labels")
+        self.label_selection_widget = guiutils.LabelSelectionWidget(self)
         self.label_selection_widget.setMaximumHeight(150)
         box.layout().addWidget(self.label_selection_widget)
-        self.connect(self.label_selection_widget,
-                     SIGNAL("selection_changed()"),
-                     self.on_target_changed)
-        
-        self.connect(self.label_selection_widget,
-                     SIGNAL("label_activated(int)"),
-                     self.on_label_activated)
-        
-        self.genes_in_columns_check = OWGUI.checkBox(box, self, "genes_in_columns",
-                                                  "Genes in columns",
-                                                  callback=self.on_genes_in_columns_change)
 
-        box = OWGUI.widgetBox(self.controlArea, "Selection")
+        self.label_selection_widget.groupChanged.connect(
+            self.on_label_activated)
+
+        self.label_selection_widget.groupSelectionChanged.connect(
+            self.on_target_changed)
+
+        box = gui.widgetBox(self.controlArea, "Selection")
         box.layout().setSpacing(0)
 
-        self.upperBoundarySpin = OWGUI.doubleSpin(box, self, "histogram.upperBoundary",
-                                                  min=-1e6, max=1e6, step= 1e-6,
-                                                  label="Upper threshold:", 
-                                                  callback=self.update_boundary, 
-                                                  callbackOnReturn=True)
-        
-        self.lowerBoundarySpin = OWGUI.doubleSpin(box, self, "histogram.lowerBoundary", 
-                                                  min=-1e6, max=1e6, step= 1e-6, 
-                                                  label="Lower threshold:", 
-                                                  callback=self.update_boundary, 
-                                                  callbackOnReturn=True)
-        
-        check = OWGUI.checkBox(box, self, "compute_null", "Compute null distribution",
-                               callback=self.update_scores)
+        self.max_value_spin = gui.doubleSpin(
+            box, self, "max_value", minv=-1e6, maxv=1e6, step=1e-6,
+            label="Upper threshold:", callback=self.update_boundary,
+            callbackOnReturn=True)
 
-        check.disables.append(OWGUI.spin(box, self, "permutations_count", min=1, max=10, 
-                                         label="Permutations:", callback=self.update_scores, 
-                                         callbackOnReturn=True))
+        self.low_value_spin = gui.doubleSpin(
+            box, self, "min_value", minv=-1e6, maxv=1e6, step=1e-6,
+            label="Lower threshold:", callback=self.update_boundary,
+            callbackOnReturn=True)
 
-        box1 = OWGUI.widgetBox(box, orientation='horizontal')
-        check.disables.append(OWGUI.doubleSpin(box1, self, "selectPValue", 
-                                               min=2e-7, max=1.0, step=1e-7, 
-                                               label="P-value:"))
-        check.disables.append(OWGUI.button(box1, self, "Select", callback=self.select_p_best))
+        check = gui.checkBox(
+            box, self, "compute_null", "Compute null distribution",
+            callback=self.update_scores)
+
+        perm_spin = gui.spin(
+            box, self, "permutations_count", minv=1, maxv=50,
+            label="Permutations:", callback=self.update_scores,
+            callbackOnReturn=True)
+
+        check.disables.append(perm_spin)
+
+        box1 = gui.widgetBox(box, orientation='horizontal')
+
+        pval_spin = gui.doubleSpin(
+            box1, self, "alpha_value", minv=2e-7, maxv=1.0, step=1e-7,
+            label="α-value:")
+        pval_select = gui.button(
+            box1, self, "Select", callback=self.select_p_best,
+            autoDefault=False
+        )
+        check.disables.append(pval_spin)
+        check.disables.append(pval_select)
+
         check.makeConsistent()
 
-        box1 = OWGUI.widgetBox(box, orientation='horizontal')
-        OWGUI.spin(box1, self, "selectNBest", 0, 10000, step=1, label="Best Ranked:")
-        OWGUI.button(box1, self, "Select", callback=self.select_n_best)
+        box1 = gui.widgetBox(box, orientation='horizontal')
+        gui.spin(box1, self, "n_best", 0, 10000, step=1,
+                 label="Best Ranked:")
+        gui.button(box1, self, "Select", callback=self.select_n_best,
+                   autoDefault=False)
 
-        box = OWGUI.widgetBox(self.controlArea, "Output")
-        b = OWGUI.button(box, self, "&Commit", callback=self.commit)
-        cb = OWGUI.checkBox(box, self, "auto_commit", "Commit on change")
-        OWGUI.setStopper(self, b, cb, "data_changed_flag", self.commit)
-        OWGUI.checkBox(box, self, "add_scores_to_output", "Add gene scores to output",
-                       callback=self.commit_if) 
-        
-        OWGUI.rubber(self.controlArea)
+        box = gui.widgetBox(self.controlArea, "Output")
 
-        self.connect(self.graphButton, SIGNAL("clicked()"), self.histogram.saveToFile)
-        
-        self.loadSettings()
+        acbox = gui.auto_commit(
+            box, self, "auto_commit", "Commit", box=None)
+        acbox.button.setDefault(True)
 
-        self.data = None
-        self.discData = None
-        self.scoreCache = {}
-        self.nullDistCache = {}
-        self.cuts = {}
-        self.null_dist = []
-        self.targets = []
-        self.scores = {}
-        self.genes_in_columns = True
-        self.target_selections = None
-        
+        gui.checkBox(box, self, "add_scores_to_output",
+                     "Add gene scores to output",
+                     callback=self._invalidate_selection)
+
+        gui.rubber(self.controlArea)
+
         self.on_scoring_method_changed()
-        
-        self.resize(800, 600)
-        
+        self._executor = concurrent.ThreadExecutor()
+
+    def sizeHint(self):
+        return QSize(800, 600)
+
     def clear(self):
-        """ Clear widget.
+        """Clear the widget state.
         """
-        self.scoreCache = {}
-        self.nullDistCache = {}
-        self.discData = None
         self.data = None
-        self.attribute_targets = []
-        self.class_targets = []
+        self.targets = []
+        self.stored_selections = []
+        self.nulldist = None
+        self.scores = None
         self.label_selection_widget.clear()
         self.clear_plot()
-        
+        self.dataInfoLabel.setText("No data on input.\n")
+        self.selectedInfoLabel.setText("\n")
+        self.__cancel_pending()
+
     def clear_plot(self):
-        """ Clear the histogram plot.
+        """Clear the histogram plot.
         """
-        self.histogram.removeDrawingCurves()
         self.histogram.clear()
-        self.histogram.replot()
-        
-    def init_from_data(self, data):
-        """ Init widget state from the data.
-        """
-        if data:
-            items = [attr.attributes.items() for attr in data.domain.attributes]
-            items = reduce(add, items, [])
-            
-            targets = defaultdict(set)
-            for label, value in items:
-                targets[label].add(value)
-                
-            targets = [(key, sorted(vals)) for key, vals in targets.items() \
-                       if len(vals) >= 2]
-            self.attribute_targets = targets
-            
-            class_var = data.domain.class_var
-            if class_var and isinstance(class_var, orange.EnumVariable):
-                targets = [(class_var.name,
-                            list(class_var.values))]
-                self.class_targets = targets
-            else:
-                self.class_targets = []
-            
-    def update_targets_widget(self):
-        """ Update the contents of the targets widget.
-        """
-        if self.data:
-            if self.genes_in_columns:
-                targets = self.attribute_targets
-            elif self.data.domain.classVar:
-                targets = self.class_targets
-            else:
-                targets = []
-        else:
-            targets = []
-            
-        self.label_selection_widget.clear()
-        self.label_selection_widget.set_labels(targets)
-        self.data_labels = targets
+
+    def initialize(self, data):
+        """Initialize widget state from the data."""
+        col_targets, row_targets = grouputils.group_candidates(data)
+        modelitems = [guiutils.standarditem_from(obj)
+                      for obj in col_targets + row_targets]
+
+        model = QStandardItemModel()
+        for item in modelitems:
+            model.appendRow(item)
+
+        self.label_selection_widget.setModel(model)
+
+        self.targets = col_targets + row_targets
+        # Default selections for all group keys
+        # (the first value is selected)
+        self.stored_selections = [[0] for _ in self.targets]
+
+    def selected_split(self):
+        index = self.label_selection_widget.currentGroupIndex()
+        if not (0 <= index < len(self.targets)):
+            return None, ()
+
+        grp = self.targets[index]
+        selection = self.label_selection_widget.currentGroupSelection()
+        selected_indices = [ind.row() for ind in selection.indexes()]
+        return grp, selected_indices
 
     def set_data(self, data):
-        self.closeContext("Data")
-        self.closeContext("TargetSelection")
-        self.error([0, 1])
-        self.warning(0)
+        self.closeContext()
+
         self.clear()
-        self.genes_in_columns_check.setEnabled(True)
+        self.error([0, 1])
         self.data = data
-        self.init_from_data(data)
 
-        if self.data:
-            self.genes_in_columns = not data_hints.get_hint(data, "genesinrows", False)
-            self.openContext("Data", data)
+        if self.data is not None:
+            self.initialize(data)
 
-            # If only attr. labels or only class values then disable
-            # the 'Genes in columns' control
-            if not self.attribute_targets or not self.class_targets:
-                self.genes_in_columns_check.setEnabled(False)
-                self.genes_in_columns = bool(self.attribute_targets)
-
-        self.update_targets_widget()
-
-        if self.data is not None  and \
-                not (self.attribute_targets or self.class_targets):
+        if self.data is not None and not self.targets:
             # If both attr. labels and classes are missing, show an error
-            self.error(1, "Cannot compute gene scores! Differential expression widget "
-                          "requires a data-set with a discrete class variable "
-                          "or attribute labels!")
+            self.error(
+                1, "Cannot compute gene scores! Differential expression "
+                   "widget requires a data-set with a discrete class "
+                   "variable(s) or column labels!"
+            )
             self.data = None
 
-        if self.data:
-            # Load context selection
-            items = [(label, v) for label, values in self.data_labels for v in values]
+        if self.data is not None:
+            # Initialize the selected groups/labels.
+            # Default selected group key
+            index = 0
+            rowshint = data_hints.get_hint(data, "genesinrows", False)
+            if not rowshint:
+                # Select the first row group split candidate (if available)
+                indices = [i for i, grp in enumerate(self.targets)
+                           if isinstance(grp, grouputils.RowGroup)]
+                if indices:
+                    index = indices[0]
 
-            self.target_selections = [values[:1] for _, values in self.data_labels]
-            label, values = self.data_labels[0]
-            self.current_target_selection = label, values[:1] # Default selections
+            self.current_group_index = index
 
-            self.openContext("TargetSelection", set(items)) # Load selections from context
-            self.label_selection_widget.set_selection(*self.current_target_selection)
+            # Restore target label selection from context settings
+            items = {(grp.name, val)
+                     for grp in self.targets for val in grp.values}
+            self.openContext(items)
+            # Restore current group / selection
+            model = self.label_selection_widget.model()
+            selection = [model.index(i, 0, model.index(keyind, 0))
+                         for keyind, selection in enumerate(self.stored_selections)
+                         for i in selection]
+            selection = guiutils.itemselection(selection)
 
-        if not self.data:
-            self.send("Example table with selected genes", None)
-            self.send("Example table with remaining genes", None)
-            self.send("Selected genes", None)
+            self.label_selection_widget.setSelection(selection)
+            self.label_selection_widget.setCurrentGroupIndex(
+                self.current_group_index)
 
-    def set_targets(self, targets):
-        """ Set the target groups for score computation.
-        """
-        self.targets = targets
-        self.update_scores()
-    
-    def compute_scores(self, data, score_func, use_attribute_labels,
-                       target=None, advance=lambda: None):
-        score_func = score_func(data, use_attribute_labels)
-        advance()
-        score = score_func(target=target)
-        score = [(key, val) for key, val in score if val is not ma.masked]
-        return score
-    
-    def compute_null_distribution(self, data, score_func, use_attributes,
-                                  target=None, perm_count=10, advance=lambda: None):
-        score_func = score_func(data, use_attributes)
-        dist = score_func.null_distribution(perm_count, target, advance=advance)
-        return [score for run in dist for k, score in run if score is not ma.masked]
-            
-    @disable_controls
+        self.commit()
+
     def update_scores(self):
-        """ Compute the scores and update the histogram.
+        """Compute the scores and update the histogram.
         """
+        self.__cancel_pending()
         self.clear_plot()
+        self.scores = None
+        self.nulldist = None
         self.error(0)
-        label, values = self.current_target_selection
-        if not self.data or label is None:
+
+        grp, split_selection = self.selected_split()
+
+        if not self.data or grp is None:
             return
-        _, score_func, _, two_sample_test = self.score_methods[self.method_index]
-        if two_sample_test:
-            target = self.targets
-            score_target = set(target)
-            ind1, ind2 = score_func(self.data, self.genes_in_columns).test_indices(score_target)
-            if not len(ind1) or not len(ind2):
-                self.error(0, "Target labels most exclude/include at least one value.")
-                return
-            
-        else: # ANOVA should use all labels. 
-            target = dict(self.data_labels)[label]
-            if self.genes_in_columns:
-                target = [(label, t) for t in target]
-            score_target = target
-#            indices = score_func(self.data, self.genes_in_columns).test_indices(score_target)
-            # TODO: Check that each label has more than one measurement, raise warning otherwise.
-         
-        pb = OWGUI.ProgressBar(self, 4 + self.permutations_count if self.compute_null else 3)
-        self.scores = dict(self.compute_scores(self.data, score_func,
-                    self.genes_in_columns, score_target, advance=pb.advance))
-        pb.advance()
-        if self.compute_null:
-            self.null_dist = self.compute_null_distribution(self.data,
-                        score_func, self.genes_in_columns, score_target,
-                        self.permutations_count, advance=pb.advance)
+
+        _, side, test_type, score_func = self.Scores[self.score_index]
+
+        def compute_scores(X, group_indices, warn=False):
+            arrays = [X[ind] for ind in group_indices]
+            ss = score_func(*arrays, axis=0)
+            return ss[0] if isinstance(ss, tuple) and not warn else ss
+
+        def permute_indices(group_indices, random_state=None):
+            assert all(ind.dtype.kind == "i" for ind in group_indices)
+            assert all(ind.ndim == 1 for ind in group_indices)
+            if random_state is None:
+                random_state = np.random
+            joined = np.hstack(group_indices)
+            random_state.shuffle(joined)
+            split_ind = np.cumsum([len(ind) for ind in group_indices])
+            return np.split(joined, split_ind[:-1])
+
+        if isinstance(grp, grouputils.RowGroup):
+            axis = 0
         else:
-            self.null_dist = []
-        pb.advance()
-        htype = self.histType[self.score_methods[self.method_index][2]]
-        score_type = self.score_methods[self.method_index][0]
-        self.histogram.type = htype
-        if self.scores:
-            self.histogram.setValues(self.scores.values())
-            low, high = self.thresholds.get(score_type, (float("-inf"), float("inf")))
-            minx, maxx = self.histogram.minx, self.histogram.maxx
-            low, high = max(low, minx), min(high, maxx)
+            axis = 1
 
-            if htype == "hiTail":
-                low = high
-            if htype == "lowTail":
-                high = low
-
-            self.histogram.setBoundary(low, high)
-
-            if self.compute_null and self.null_dist:
-                nullY, nullX = numpy.histogram(self.null_dist, bins=self.histogram.xData)
-                nullY = nullY / self.permutations_count
-                self.histogram.nullCurve = self.histogram.addCurve(
-                    "nullCurve", Qt.black, Qt.black, 6,
-                    symbol=QwtSymbol.NoSymbol, style=QwtPlotCurve.Steps,
-                    xData=nullX, yData=nullY)
-
-                minx = min(min(nullX), minx)
-                maxx = max(max(nullX), maxx)
-                miny = min(min(nullY), self.histogram.miny)
-                maxy = max(max(nullY), self.histogram.maxy)
-                spanx, spany = maxx - minx, maxy - miny
-                self.histogram.setAxisScale(
-                    QwtPlot.xBottom, minx - 0.05 * spanx, maxx + 0.05 * spanx)
-                self.histogram.setAxisScale(
-                    QwtPlot.yLeft, miny - 0.05 * spany, maxy + 0.05 * spany)
-
-            state = dict(hiTail=(False, True), lowTail=(True, False), twoTail=(True, True))
-            for spin, visible in zip((self.upperBoundarySpin, self.lowerBoundarySpin), state[self.histogram.type]):
-                spin.setVisible(visible)
-
-            # If this is a two sample test add markers to the left and right
-            # plot indicating which target group is over-expressed in that
-            # part
-            if self.method_index in [0, 2, 6]:
-                if self.method_index == 0: ## fold change is centered on 1.0
-                    x1, y1 = (self.histogram.minx + 1) / 2 , self.histogram.maxy
-                    x2, y2 = (self.histogram.maxx + 1) / 2 , self.histogram.maxy
-                else:
-                    x1, y1 = (self.histogram.minx) / 2 , self.histogram.maxy
-                    x2, y2 = (self.histogram.maxx) / 2 , self.histogram.maxy
-                if self.genes_in_columns:
-                    label = target[0][0]
-                    target_values = [t[1] for t in target]
-                    values = dict(self.data_labels)[label]
-                else:
-                    target_values = target
-                    values = self.data_labels[0][1]
-                    
-                left = ", ".join(v for v in values if v not in target_values)
-                right = ", ".join(v for v in values if v in target_values)
-                    
-                self.histogram.addMarker(left, x1, y1)
-                self.histogram.addMarker(right, x2, y2)
-            self.warning(0)
+        if test_type == OWFeatureSelection.TwoSampleTest:
+            G1 = grouputils.group_selection_mask(
+                self.data, grp, split_selection)
+            G2 = ~G1
+            indices = [np.flatnonzero(G1), np.flatnonzero(G2)]
+        elif test_type == self.VarSampleTest:
+            indices = [grouputils.group_selection_mask(self.data, grp, [i])
+                       for i in range(len(grp.values))]
+            indices = [np.flatnonzero(ind) for ind in indices]
         else:
-            self.warning(0, "No scores obtained.")
-        self.histogram.replot()
-        pb.advance()
-        pb.finish()
+            assert False
+
+        if not all(np.count_nonzero(ind) > 0 for ind in indices):
+            self.error(0, "Target labels most exclude/include at least one "
+                          "value.")
+            self.scores = None
+            self.nulldist = None
+            self.update_data_info_label()
+            return
+
+        X = self.data.X
+        if axis == 1:
+            X = X.T
+
+        # TODO: Check that each label has more than one measurement,
+        # raise warning otherwise.
+
+        def compute_scores_with_perm(X, indices, nperm=0, rstate=None,
+                                     progress_advance=None):
+            warning = None
+            scores = compute_scores(X, indices, warn=True)
+            if isinstance(scores, tuple):
+                scores, warning = scores
+
+            if progress_advance is not None:
+                progress_advance()
+            null_scores = []
+            if nperm > 0:
+                if rstate is None:
+                    rstate = np.random.RandomState(0)
+
+                for i in range(nperm):
+                    p_indices = permute_indices(indices, rstate)
+                    assert all(pind.shape == ind.shape
+                               for pind, ind in zip(indices, p_indices))
+                    pscore = compute_scores(X, p_indices)
+                    assert pscore.shape == scores.shape
+                    null_scores.append(pscore)
+                    if progress_advance is not None:
+                        progress_advance()
+
+            return scores, null_scores, warning
+
+        p_advance = concurrent.methodinvoke(
+            self, "progressBarAdvance", (float,))
+        state = namespace(cancelled=False, advance=p_advance)
+
+        def progress():
+            if state.cancelled:
+                raise concurrent.CancelledError
+            else:
+                state.advance(100 / (nperm + 1))
+
+        self.progressBarInit()
+        set_scores = concurrent.methodinvoke(
+            self, "__set_score_results", (concurrent.Future,))
+
+        nperm = self.permutations_count if self.compute_null else 0
+        self.__scores_state = state
+        self.__scores_future = self._executor.submit(
+                compute_scores_with_perm, X, indices, nperm,
+                progress_advance=progress)
+        self.__scores_future.add_done_callback(set_scores)
+
+    @Slot(float)
+    def __pb_advance(self, value):
+        self.progressBarAdvance(value, )
+
+    @Slot(float)
+    def progressBarAdvance(self, value):
+        if not self.__in_progress:
+            self.__in_progress = True
+            try:
+                super().progressBarAdvance(value)
+            finally:
+                self.__in_progress = False
+
+    @Slot(concurrent.Future)
+    def __set_score_results(self, scores):
+        # set score results from a Future
+        self.error(1)
+        self.warning(10)
+        if scores is self.__scores_future:
+            self.histogram.setUpdatesEnabled(True)
+            self.progressBarFinished()
+
+            if not self.__scores_state.cancelled:
+                try:
+                    results = scores.result()
+                except Exception as ex:
+                    self.error(1, "Error: {!s}".format(ex))
+                else:
+                    self.set_scores(*results)
+
+        elif self.__scores_future is None:
+            self.histogram.setUpdatesEnabled(True)
+            self.progressBarFinished()
+
+    def __cancel_pending(self):
+        if self.__scores_future is not None:
+            self.__scores_future.cancel()
+            self.__scores_state.cancelled = True
+            self.__scores_state = self.__scores_future = None
+
+    def set_scores(self, scores, null_scores=None, warning=None):
+        self.scores = scores
+        self.nulldist = null_scores
+
+        if null_scores:
+            nulldist = np.array(null_scores, dtype=float)
+        else:
+            nulldist = None
+
+        self.warning(10, warning)
+
+        self.setup_plot(self.score_index, scores, nulldist)
         self.update_data_info_label()
+        self.update_selected_info_label()
+        self.commit()
 
-    def on_boundary_change(self, low, high):
-        stype = self.score_methods[self.method_index][0]
-        self.thresholds[stype] = (low, high)
-        self.update_selected_info_label(low, high)
-        self.commit_if()
+    def setup_plot(self, scoreindex, scores, nulldist=None):
+        """
+        Setup the score histogram plot
+
+        Parameters
+        ----------
+        scoreindex : int
+            Score index (into OWFeatureSelection.Scores)
+        scores : (N, ) array
+            The scores obtained
+        nulldist (P, N) array optional
+            The scores obtained under P permutations of labels.
+        """
+        score_name, side, test_type, _ = self.Scores[scoreindex]
+        low, high = self.thresholds.get(score_name, (-np.inf, np.inf))
+
+        validmask = np.isfinite(scores)
+        validscores = scores[validmask]
+
+        nbins = int(max(np.ceil(np.sqrt(len(validscores))), 20))
+        freq, edges = np.histogram(validscores, bins=nbins)
+        self.histogram.setHistogramCurve(
+            pg.PlotCurveItem(x=edges, y=freq, stepMode=True,
+                             pen=pg.mkPen("b", width=2))
+        )
+
+        if nulldist is not None:
+            nulldist = nulldist.ravel()
+            validmask = np.isfinite(nulldist)
+            validnulldist = nulldist[validmask]
+            nullbins = edges  # XXX: extend to the full range of nulldist
+            nullfreq, _ = np.histogram(validnulldist, bins=nullbins)
+            nullfreq = nullfreq * (freq.sum() / nullfreq.sum())
+            nullitem = pg.PlotCurveItem(
+                x=nullbins, y=nullfreq, stepMode=True,
+                pen=pg.mkPen((50, 50, 50, 100))
+            )
+            # Ensure it stacks behind the main curve
+            nullitem.setZValue(nullitem.zValue() - 10)
+            self.histogram.addItem(nullitem)
+
+        # Restore saved thresholds
+        eps = np.finfo(float).eps
+        minx, maxx = edges[0] - eps, edges[-1] + eps
+        low, high = max(low, minx), min(high, maxx)
+
+        if side == OWFeatureSelection.LowTail:
+            mode = Histogram.Low
+        elif side == OWFeatureSelection.HighTail:
+            mode = Histogram.High
+        elif side == OWFeatureSelection.TwoTail:
+            mode = Histogram.TwoSided
+        else:
+            assert False
+        self.histogram.setSelectionMode(mode)
+        self.histogram.setBoundary(low, high)
+
+        # If this is a two sample test add markers to the left and right
+        # plot indicating which group is over-expressed in that part
+        if test_type == OWFeatureSelection.TwoSampleTest and \
+                side == OWFeatureSelection.TwoTail:
+            maxy = np.max(freq)
+            # XXX: Change use of integer constant
+            if scoreindex == 0:  # fold change is centered on 1.0
+                x1, y1 = (minx + 1) / 2, maxy
+                x2, y2 = (maxx + 1) / 2, maxy
+            else:
+                x1, y1 = minx / 2, maxy
+                x2, y2 = maxx / 2, maxy
+
+            grp, selected_indices = self.selected_split()
+
+            values = grp.values
+            selected_values = [values[i] for i in selected_indices]
+
+            left = ", ".join(v for v in values if v not in selected_values)
+            right = ", ".join(v for v in selected_values)
+
+            labelitem = pg.TextItem(left, color=(40, 40, 40))
+            labelitem.setPos(x1, y1)
+            self.histogram.addItem(labelitem)
+
+            labelitem = pg.TextItem(right, color=(40, 40, 40))
+            labelitem.setPos(x2, y2)
+            self.histogram.addItem(labelitem)
+
+        miny, maxy = 0.0, np.max(freq)
+        if nulldist is not None:
+            maxy = max(np.max(nullfreq), maxy)
+
+        if not np.any(np.isnan([maxx, minx, maxy])):
+            self.histogram.setRange(
+                QRectF(minx, miny, maxx - minx, maxy - miny),
+                padding=0.05
+            )
 
     def update_data_info_label(self):
-        if self.data:
+        if self.data is not None:
             samples, genes = len(self.data), len(self.data.domain.attributes)
-            if self.genes_in_columns:
+            grp, indices = self.selected_split()
+            if isinstance(grp, grouputils.ColumnGroup):
                 samples, genes = genes, samples
-                target_labels = [t[1] for t in self.targets]
-            else:
-                target_labels = self.targets
+
+            target_labels = [grp.values[i] for i in indices]
             text = "%i samples, %i genes\n" % (samples, genes)
             text += "Sample target: '%s'" % (",".join(target_labels))
         else:
-            text = "No data on input\n"
+            text = "No data on input.\n"
+
         self.dataInfoLabel.setText(text)
 
-    def update_selected_info_label(self, cutOffLower=0, cutOffUpper=0):
-        self.cuts[self.method_index] = (cutOffLower, cutOffUpper)
-        if self.data:
-            scores = np.array(self.scores.values())
-            test = self.score_methods[self.method_index][2]
-            self.selectedInfoLabel.setText("%i selected genes" % len(np.nonzero(test(scores, cutOffLower, cutOffUpper))[0]))
-        else:
-            self.selectedInfoLabel.setText("0 selected genes")
+    def update_selected_info_label(self):
+        pl = lambda c: "" if c == 1 else "s"
+        if self.data is not None and self.scores is not None:
+            scores = self.scores
+            low, high = self.min_value, self.max_value
+            _, side, _, _ = self.Scores[self.score_index]
+            test = self.test_f[side]
+            count_undef = np.count_nonzero(np.isnan(scores))
+            count_scores = len(scores)
+            scores = scores[np.isfinite(scores)]
 
-    def select_n_best(self):
-        scores = self.scores.items()
-        scores.sort(lambda a,b:cmp(a[1], b[1]))
-        if not scores:
-            return
-        if self.score_methods[self.method_index][2]==self.oneTailTestHi:
-            scores = scores[-max(self.selectNBest, 1):]
-            self.histogram.setBoundary(scores[0][1], scores[0][1])
-        elif self.score_methods[self.method_index][2]==self.oneTailTestLow:
-            scores = scores[:max(self.selectNBest,1)]
-            self.histogram.setBoundary(scores[-1][1], scores[-1][1])
+            nselected = np.count_nonzero(test(scores, low, high))
+            defined_txt = ("{} of {} score{} undefined."
+                           .format(count_undef, count_scores, pl(count_scores)))
+
+        elif self.data is not None:
+            nselected = 0
+            defined_txt = "No defined scores"
         else:
-            scoresHi = scores[-max(min(self.selectNBest, len(scores)/2), 1):]
-            scoresLo = scores[:max(min(self.selectNBest, len(scores)/2), 1)]
-            scores = [(abs(score), 1) for attr, score in scoresHi] + [(abs(score), -1) for attr, score in scoresLo]
-            if self.score_methods[self.method_index][0]=="fold change": ## comparing fold change on a logaritmic scale
-                scores =  [(abs(math.log(max(min(score, 1e300), 1e-300), 2.0)), sign) for score, sign in scores]
-            scores.sort()
-            scores = scores[-max(self.selectNBest, 1):]
-            countHi = len([score for score, sign in scores if sign==1])
-            countLo = len([score for score, sign in scores if sign==-1])
-            cutHi = scoresHi[-countHi][1] if countHi else scoresHi[-1][1] + 1e-7
-            cutLo = scoresLo[countLo-1][1] if countLo else scoresLo[0][1] - 1e-7
-            self.histogram.setBoundary(cutLo, cutHi)
+            nselected = 0
+            defined_txt = ""
+
+        self.selectedInfoLabel.setText(
+            defined_txt + "\n" +
+            "{} selected gene{}".format(nselected, pl(nselected))
+        )
+
+    def __on_histogram_plot_selection_changed(self):
+        low, high = self.histogram.boundary()
+        scorename, side, _, _ = self.Scores[self.score_index]
+        self.thresholds[scorename] = (low, high)
+        self.min_value = low
+        self.max_value = high
+        self.update_selected_info_label()
 
     def update_boundary(self):
-        if self.data != None and self.scores.items():
-            if self.score_methods[self.method_index][2]==self.oneTailTestHi:
-                self.histogram.setBoundary(self.histogram.lowerBoundary, self.histogram.lowerBoundary)
-            elif self.score_methods[self.method_index][2]==self.oneTailTestLow:
-                self.histogram.setBoundary(self.histogram.upperBoundary, self.histogram.upperBoundary)
-            else:
-                self.histogram.setBoundary(self.histogram.lowerBoundary, self.histogram.upperBoundary)
+        # The cutoff boundary value has been changed by the user
+        # (in the controlArea widgets). Update the histogram plot
+        # accordingly.
+        if self.data is None:
+            return
+
+        _, side, _, _ = self.Scores[self.score_index]
+        if side == OWFeatureSelection.LowTail:
+            self.histogram.setLower(self.min_value)
+        elif side == OWFeatureSelection.HighTail:
+            self.histogram.setUpper(self.max_value)
+        elif side == OWFeatureSelection.TwoTail:
+            self.histogram.setBoundary(self.min_value, self.max_value)
+
+        self._invalidate_selection()
+
+    def select_n_best(self):
+        """
+        Select the `self.n_best` scored genes.
+        """
+        if self.scores is None:
+            return
+
+        score_name, side, _, _ = self.Scores[self.score_index]
+        scores = self.scores
+        scores = np.sort(scores[np.isfinite(scores)])
+
+        if side == OWFeatureSelection.HighTail:
+            cut = scores[-np.clip(self.n_best, 1, len(scores))]
+            self.histogram.setUpper(cut)
+        elif side == OWFeatureSelection.LowTail:
+            cut = scores[np.clip(self.n_best, 0, len(scores) - 1)]
+            self.histogram.setLower(cut)
+        elif side == OWFeatureSelection.TwoTail:
+            n = min(self.n_best, len(scores))
+            scoresabs = np.abs(scores)
+            if score_name == "Fold Change":
+                # comparing fold change on a logarithmic scale
+                scores = np.log2(scoresabs)
+                scores = scores[np.isfinite(scoresabs)]
+            scoresabs = np.sort(np.abs(scores))
+            limit = (scoresabs[-n] + scoresabs[-min(n+1, len(scores))]) / 2
+            cuthigh, cutlow = limit, -limit
+            if score_name == "Fold Change":
+                cuthigh, cutlow = 2**cuthigh, 2**cutlow
+            self.histogram.setBoundary(cutlow, cuthigh)
+        self._invalidate_selection()
 
     def select_p_best(self):
-        if not self.null_dist:
+        if not self.nulldist:
             return
-        nullDist = sorted(self.null_dist)
-        test = self.score_methods[self.method_index][2]
-        count = min(int(len(nullDist)*self.selectPValue), len(nullDist))
-        if test == self.oneTailTestHi:
-            cut = nullDist[-count] if count else nullDist[-1] # + 1e-7
-            self.histogram.setBoundary(cut, cut)
-        elif test == self.oneTailTestLow:
-            cut = nullDist[count - 1] if count else nullDist[0] # - 1e-7
-            self.histogram.setBoundary(cut, cut)
-        elif count:
-            scoresHi = nullDist[-count:]
-            scoresLo = nullDist[:count]
-            scores = [(abs(score), 1) for score in scoresHi] + [(abs(score), -1) for score in scoresLo]
-            if self.score_methods[self.method_index][0] == "fold change": ## fold change is on a logaritmic scale
-                scores =  [(abs(math.log(max(min(score, 1e300), 1e-300), 2.0)), sign) for score, sign in scores]
-            scores = sorted(scores)[-count:]
-            countHi = len([score for score, sign in scores if sign==1])
-            countLo = len([score for score, sign in scores if sign==-1])
-            cutHi = scoresHi[-countHi] if countHi else scoresHi[-1] + 1e-7
-            cutLo = scoresLo[countLo-1] if countLo else scoresLo[0] - 1e-7
-            self.histogram.setBoundary(cutLo, cutHi)
-        else:
-            self.histogram.setBoundary(nullDist[0] - 1e-7, nullDist[-1] + 1e-7)
-            
 
-    def commit_if(self):
-        if self.auto_commit:
-            self.commit()
-        else:
-            self.data_changed_flag = True
-        
-    def commit(self):
-        if not self.data or not self.scores:
-            return
-        test = self.score_methods[self.method_index][2]
-        
-        cutOffUpper = self.histogram.upperBoundary
-        cutOffLower = self.histogram.lowerBoundary
-        
-        scores = np.array(self.scores.items())
-        scores[:, 1] = test(np.array(scores[:, 1], dtype=float), cutOffLower, cutOffUpper)
-        selected = set([key for key, test in scores if test])
-        remaining = set([key for key, test in scores if not test])
-        if self.data and self.genes_in_columns:
-            selected = sorted(selected)
-            if selected:
-                newdata = orange.ExampleTable(
-                    orange.Domain(self.data.domain),
-                    [self.data[int(i)] for i in selected],
-                    name=self.data.name
-                )
-            else:
-                newdata = None
-            if self.add_scores_to_output:
-                score_attr = orange.FloatVariable(self.score_methods[self.method_index][0])
-                mid = orange.newmetaid()
-                
-            if self.add_scores_to_output and newdata is not None:
-                newdata.domain.addmeta(mid, score_attr)
-                for ex, key in zip(newdata, selected):
-                    ex[mid] = self.scores[key]
-                    
-            self.send("Example table with selected genes", newdata)
-            
-            remaining = sorted(remaining)
-            if remaining:
-                newdata = orange.ExampleTable(
-                    orange.Domain(self.data.domain),
-                    [self.data[int(i)] for i in remaining],
-                    name=self.data.name
-                )
-            else:
-                newdata = None
-            
-            if self.add_scores_to_output and newdata is not None:
-                newdata.domain.addmeta(mid, score_attr)
-                for ex, key in zip(newdata, remaining):
-                    ex[mid] = self.scores[key]
-                    
-            self.send("Example table with remaining genes", newdata)
-            
-        elif self.data and not self.genes_in_columns:
-            method_name = self.score_methods[self.method_index][0]
-            selected_attrs = [attr for attr in self.data.domain.attributes
-                              if attr in selected or
-                              attr.varType == orange.VarTypes.String]  # ?? why strings
-            if self.add_scores_to_output:
-                scores = [self.scores[attr] for attr in selected_attrs]
-                attrs = [copy_descriptor(attr) for attr in selected_attrs]
-                for attr, score in zip(attrs, scores):
-                    attr.attributes[method_name] = str(score)
-                selected_attrs = attrs
+        _, side, _, _ = self.Scores[self.score_index]
+        nulldist = np.asarray(self.nulldist).ravel()
+        nulldist = nulldist[np.isfinite(nulldist)]
+        nulldist = np.sort(nulldist)
 
-            newdomain = orange.Domain(selected_attrs, self.data.domain.classVar)
-            newdomain.addmetas(self.data.domain.getmetas())
-            newdata = orange.ExampleTable(
-                newdomain, self.data, name=self.data.name
-            )
-            self.send("Example table with selected genes",
-                      newdata if selected_attrs else None)
+        assert 0 <= self.alpha_value <= 1
+        p = self.alpha_value
+        if side == OWFeatureSelection.HighTail:
+            cut = np.percentile(nulldist, 100 * (1 - p))
+            self.max_value = cut
+            self.histogram.setUpper(cut)
+        elif side == OWFeatureSelection.LowTail:
+            cut = np.percentile(nulldist, 100 * p)
+            self.min_value = cut
+            self.histogram.setLower(cut)
+        elif side == OWFeatureSelection.TwoTail:
+            p1, p2 = np.percentile(nulldist, [100 * p / 2, 100 * (1 - p / 2)])
+            self.histogram.setBoundary(p1, p2)
+        self._invalidate_selection()
 
-            remaining_attrs = [attr for attr in self.data.domain.attributes
-                               if attr in remaining]
-            if self.add_scores_to_output:
-                scores = [self.scores[attr] for attr in remaining_attrs]
-                attrs = [copy_descriptor(attr) for attr in remaining_attrs]
-                for attr, score in zip(attrs, scores):
-                    attr.attributes[method_name] = str(scores)
-                remaining_attrs = attrs
-
-            newdomain = orange.Domain(remaining_attrs, self.data.domain.classVar)
-            newdomain.addmetas(self.data.domain.getmetas())
-            newdata = orange.ExampleTable(
-                newdomain, self.data, name=self.data.name
-            )
-            self.send("Example table with remaining genes",
-                      newdata if remaining_attrs else None)
-
-            domain = orange.Domain([orange.StringVariable("label"),
-                                    orange.FloatVariable(self.score_methods[self.method_index][0])],
-                                    False)
-            if selected_attrs:
-                selected_genes = orange.ExampleTable(domain,
-                            [[attr.name, self.scores.get(attr, 0)] for attr in selected_attrs])
-            else:
-                selected_genes = None
-            self.send("Selected genes",  selected_genes)
-            
-        else:
-            self.send("Example table with selected genes", None)
-            self.send("Example table with remaining genes", None)
-            self.send("Selected genes", None)
-        self.data_changed_flag = False
+    def _invalidate_selection(self):
+        self.commit()
 
     def on_target_changed(self):
-        label, values = self.label_selection_widget.current_selection()
-
-        if values is None:
-            values = []
-
-        if self.genes_in_columns:
-            targets = [(label, t) for t in values]
-        else:
-            targets = values
-
-        self.targets = targets
-        self.current_target_selection = label, values
-        # Save target label selection
-        labels = [l for l, _ in self.data_labels]
-        if label in labels:
-            label_index = labels.index(label)
-            self.target_selections[label_index] = values
-        self.set_targets(targets)
+        grp, indices = self.selected_split()
+        if grp is None:
+            return
+        # Store target group label selection.
+        self.stored_selections[self.targets.index(grp)] = indices
+        self.update_scores()
 
     def on_label_activated(self, index):
-        selection = self.target_selections[index]
-        if not selection:
-            selection = self.data_labels[index][1][:1]
-        self.label_selection_widget.set_selection(index, selection)
+        self.current_group_index = index
+        self.update_scores()
 
-    def on_genes_in_columns_change(self):
-        self.closeContext("TargetSelection")
-        self.update_targets_widget()
-        items = [(label, v) for label, values in self.data_labels \
-                                for v in values]
-        if self.data_labels:
-            label, values = self.data_labels[0] 
-            self.current_target_selection = label, values[:1]
-            self.target_selections = [values[1:] for _, values in self.data_labels]
-            self.openContext("TargetSelection", set(items))
-            self.label_selection_widget.set_selection(*self.current_target_selection)
-        
     def on_scoring_method_changed(self):
-        two_sample = self.score_methods[self.method_index][3]
-        self.label_selection_widget.values_view.setDisabled(not two_sample)
-        
-    def settingsFromWidgetCallbackTargetSelection(self, handler, context):
-        context.target_selections = self.target_selections
-        context.current_target_selection = self.current_target_selection
-        
-    def settingsToWidgetCallbackTargetSelection(self, handler, context):
-        self.target_selections = getattr(context, "target_selections", self.target_selections)
-        self.current_target_selection = getattr(context, "current_target_selection", self.current_target_selection)
+        _, _, test_type, _ = self.Scores[self.score_index]
+        self.label_selection_widget.values_view.setEnabled(
+            test_type == OWFeatureSelection.TwoSampleTest
+        )
+        self.__update_threshold_spinbox()
+
+    def __update_threshold_spinbox(self):
+        _, side, _, _ = self.Scores[self.score_index]
+        self.low_value_spin.setVisible(side & OWFeatureSelection.LowTail)
+        self.max_value_spin.setVisible(side & OWFeatureSelection.HighTail)
+
+    def commit(self):
+        """
+        Commit (send) the outputs.
+        """
+        if self.data is None or self.scores is None:
+            return
+
+        grp, _ = self.selected_split()
+        if isinstance(grp, grouputils.RowGroup):
+            axis = 1
+        else:
+            axis = 0
+
+        score_name, side, _, _ = self.Scores[self.score_index]
+        low, high = self.histogram.boundary()
+
+        scores = self.scores
+        mask = np.isfinite(scores)
+        test = self.test_f[side]
+        selected_masked = test(scores[mask], low, high)
+        selected = np.zeros_like(scores, dtype=bool)
+        selected[mask] = selected_masked
+
+        indices = np.flatnonzero(selected)
+        remaining = np.flatnonzero(~selected)
+
+        domain = self.data.domain
+
+        if axis == 0:
+            # Select rows
+            score_var = Orange.data.ContinuousVariable(score_name)
+            domain = Orange.data.Domain(domain.attributes, domain.class_vars,
+                                        domain.metas + (score_var,))
+            data = self.data.from_table(domain, self.data)
+            data[:, score_var] = np.c_[scores]
+            subsetdata = data[indices]
+            remainingdata = data[remaining]
+        else:
+            # select columns
+            attrs = [copy_variable(var) for var in domain.attributes]
+            for var, score in zip(attrs, scores):
+                var.attributes[score_name] = str(score)
+
+            selected_attrs = [attrs[i] for i in indices]
+            remaining_attrs = [attrs[i] for i in remaining]
+
+            domain = Orange.data.Domain(
+                selected_attrs, domain.class_vars, domain.metas)
+            subsetdata = self.data.from_table(domain, self.data)
+
+            domain = Orange.data.Domain(
+                remaining_attrs, domain.class_vars, domain.metas)
+            remainingdata = self.data.from_table(domain, self.data)
+
+        self.send("Data subset", subsetdata)
+        self.send("Remaining data subset", remainingdata)
+        self.send("Selected genes", None)
+
+    def send_report(self):
+        self.report_plot()
+        caption = report.render_items_vert((
+            ("Scoring method", self.Scores[self.score_index][0]),
+            ("Upper treshold", self.max_value),
+            ("Lower threshold", self.min_value),
+            ("Compute null distribution", self.compute_null),
+            ("Permutations", self.permutations_count),
+            ("α-value", self.alpha_value),
+            ("Best Ranked", self.n_best)
+        ))
+        self.report_caption(caption)
+        self.report_caption(self.selectedInfoLabel.text())
+
+    def onDeleteWidget(self):
+        super().onDeleteWidget()
+        self.clear()
+        self.__cancel_pending()
+        self._executor.shutdown(wait=True)
 
 
-def copy_descriptor(desc):
-    d = desc.clone()
-    d.attributes = dict(desc.attributes)
-    c = Orange.core.ClassifierFromVar()
-    c.whichVar = desc
-    d.get_value_from = c
-    return d
+def copy_variable(var):
+    clone = var.copy(compute_value=transformation.Identity(var))
+    clone.attributes = dict(var.attributes)
+    return clone
+
+import unittest
 
 
-if __name__=="__main__":
-    import sys
-    app = QApplication(sys.argv)
-    data = orange.ExampleTable(os.path.expanduser("~/Documents/GDS636"))
+class Test_f_oneway(unittest.TestCase):
+    def test_f_oneway(self):
+        g1 = np.array([0.1, -0.1, 0.2, -0.2])
+        g2 = g1 + 1
+        g3 = g1
+
+        f1, p1 = scipy.stats.f_oneway(g1, g2)
+        f, p = f_oneway(g1, g2)
+        np.testing.assert_almost_equal([f, p], [f1, p1])
+
+        f, p = f_oneway(np.c_[g1], np.c_[g2], axis=0)
+        np.testing.assert_almost_equal([f[0], p[0]], [f1, p1])
+
+        f1, p1 = scipy.stats.f_oneway(g1, g2, g3)
+        f, p = f_oneway(g1, g2, g3)
+        np.testing.assert_almost_equal([f, p], [f1, p1])
+
+        G1 = np.random.normal(size=(10, 30))
+        G2 = np.random.normal(loc=1, size=(10, 20))
+        G3 = np.random.normal(loc=2, size=(10, 10))
+
+        F, P = f_oneway(G1, G2, G3, axis=1)
+        self.assertEqual(F.shape, (10,))
+        self.assertEqual(P.shape, (10,))
+
+        FP1 = [scipy.stats.f_oneway(g1, g2, g3)
+               for g1, g2, g3 in zip(G1, G2, G3)]
+
+        F1 = [f for f, _ in FP1]
+        P1 = [p for _, p in FP1]
+        np.testing.assert_almost_equal(F1, F)
+        np.testing.assert_almost_equal(P1, P)
+
+        F, P = f_oneway(G1.T, G2.T, G3.T, axis=0)
+        np.testing.assert_almost_equal(F1, F)
+        np.testing.assert_almost_equal(P1, P)
+
+
+def main(argv=None):
+    from AnyQt.QtWidgets import QApplication
+    app = QApplication(list(argv) if argv else [])
+    argv = app.arguments()
+    if len(argv) > 1:
+        filename = argv[1]
+    else:
+        filename = "geo-gds360"
+    data = Orange.data.Table(filename)
+
     w = OWFeatureSelection()
     w.show()
+    w.raise_()
     w.set_data(data)
-    app.exec_()
+    rval = app.exec_()
+    w.set_data(None)
     w.saveSettings()
+    w.onDeleteWidget()
+    return rval
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

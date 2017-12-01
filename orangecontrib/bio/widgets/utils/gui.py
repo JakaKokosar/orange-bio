@@ -1,23 +1,19 @@
 import sys
 import warnings
 import re
+import Orange.data
+
 
 from xml.sax.saxutils import escape
 from contextlib import contextmanager
 from itertools import starmap, chain
 from collections import namedtuple, defaultdict
-
-if sys.version_info < (3, 4):
-    from singledispatch import singledispatch
-else:
-    from functools import singledispatch
+from functools import singledispatch
 
 from AnyQt import QtGui, QtCore, QtWidgets
-
 from AnyQt.QtWidgets import QCompleter
 from AnyQt.QtCore import Qt, QObject, QStringListModel, pyqtSignal as Signal
 
-import Orange.data
 from Orange.widgets.utils import itemmodels
 from Orange.widgets import gui as _gui
 

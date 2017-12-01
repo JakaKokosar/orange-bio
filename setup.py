@@ -1,14 +1,7 @@
 #!/usr/bin/env python
 
-import sys
 import os
-
-try:
-    from setuptools import setup, find_packages
-except ImportError:
-    import ez_setup
-    ez_setup.use_setuptools()
-    from setuptools import setup, find_packages
+from setuptools import setup, find_packages
 
 
 NAME = 'Orange-Bioinformatics'
@@ -55,105 +48,58 @@ CLASSIFIERS = (
     'Intended Audience :: Developers',
 )
 
-PACKAGES = find_packages(
-)
+PACKAGES = find_packages()
+PACKAGE_DATA = {}
 
-PACKAGE_DATA = {
-}
+requirements = ['requirements.txt']
 
-# Backwards compatibility stub. Should be removed by the 2.7 release.
-PY_MODULES = ["_bioinformatics"]
-
-SETUP_REQUIRES = (
-    'setuptools',
-)
-
-INSTALL_REQUIRES = (
-    'Orange3' if sys.version_info > (3, ) else 'Orange',
-    'setuptools',
-    'numpy',
-    'scipy',
-    'six',
-    'genesis-pyapi>=1.1.2',
-    "slumber>=0.7.1",
-    "requests>=2.11.1",
-    "requests-cache>=0.4.12",
-    "serverfiles>=0.2",
-    # Dependencies which are problematic to install automatically
-    #'openbabel-python', # You get bindings together with the openbabel library and not stand-alone
-    #'scipy', # Requires Fortran compiler
-    #'matplotlib', # Requires that numpy is installed first
-)
-
-if sys.version_info > (3, ):
-    INSTALL_REQUIRES = INSTALL_REQUIRES + ("pyqtgraph", "AnyQt")
-
-if sys.version_info < (3, 3):
-    INSTALL_REQUIRES = INSTALL_REQUIRES + ("backports.unittest_mock",)
-
-if sys.version_info < (3, 4):
-    INSTALL_REQUIRES = INSTALL_REQUIRES + ("singledispatch",)
-
-if sys.version_info < (3, 5):
-    INSTALL_REQUIRES = INSTALL_REQUIRES + ("typing",)
+INSTALL_REQUIRES = sorted(set(
+    line.partition('#')[0].strip()
+    for file in (os.path.join(os.path.dirname(__file__), file)
+                 for file in requirements)
+    for line in open(file)
+) - {''})
 
 
 EXTRAS_REQUIRE = {
-    'MOL_DEPICT': (
-        'oasa'
-    ),
-    'NETWORK': (
-        'Orange[NETWORK]'
-    ),
+    ':python_version<="3.4"': ["typing"],
 }
-
-DEPENDENCY_LINKS = (
-#    'http://bkchem.zirael.org/download/bkchem-0.13.0.tar.gz',
-#    'http://orange.biolab.si/download/bkchem-0.13.0.tar.gz',
-    'http://orange.biolab.si/download/oasa-0.13.1.tar.gz',
-    'http://bkchem.zirael.org/download/oasa-0.13.1.tar.gz',
-)
 
 ENTRY_POINTS = {
     'orange.addons': (
-        'bio = orangecontrib.bio',
+        'bio = orangecontrib.bio'
     ),
     'orange.widgets': (
-        ('Bioinformatics = orangecontrib.bio.widgets',
-         'Prototypes = orangecontrib.bio.widgets.prototypes')
-        if sys.version_info < (3, ) else
-        ('Bioinformatics = orangecontrib.bio.widgets3',)
+        'Bioinformatics = orangecontrib.bio.widgets'
     ),
     'orange.canvas.help': (
-        ('intersphinx = orangecontrib.bio.widgets:intersphinx'
-        if sys.version_info < (3,) else
-        'html-index = orangecontrib.bio.widgets3:WIDGET_HELP_PATH'),
+        'html-index = orangecontrib.bio.widgets:WIDGET_HELP_PATH'
     )
 }
 
 NAMESPACE_PACAKGES = ["orangecontrib", "orangecontrib.bio"]
 
+TEST_SUITE = "orangecontrib.bio.tests.suite"
+
 if __name__ == '__main__':
     setup(
-        name = NAME,
-        version = VERSION,
-        description = DESCRIPTION,
-        long_description = LONG_DESCRIPTION,
-        author = AUTHOR,
-        author_email = AUTHOR_EMAIL,
-        url = URL,
-        license = LICENSE,
-        keywords = KEYWORDS,
-        classifiers = CLASSIFIERS,
-        packages = PACKAGES,
-        package_data = PACKAGE_DATA,
-        py_modules = PY_MODULES,
-        setup_requires = SETUP_REQUIRES,
-        install_requires = INSTALL_REQUIRES,
-        extras_require = EXTRAS_REQUIRE,
-        dependency_links = DEPENDENCY_LINKS,
-        entry_points = ENTRY_POINTS,
+        name=NAME,
+        version=VERSION,
+        description=DESCRIPTION,
+        long_description=LONG_DESCRIPTION,
+        author=AUTHOR,
+        author_email=AUTHOR_EMAIL,
+        url=URL,
+        license=LICENSE,
+        keywords=KEYWORDS,
+        classifiers=CLASSIFIERS,
+        packages=PACKAGES,
+        package_data=PACKAGE_DATA,
+        install_requires=INSTALL_REQUIRES,
+        extras_require=EXTRAS_REQUIRE,
+        entry_points=ENTRY_POINTS,
         namespace_packages=NAMESPACE_PACAKGES,
-        include_package_data = True,
-        zip_safe = False,
+        test_suite=TEST_SUITE,
+        include_package_data=True,
+        zip_safe=False,
     )

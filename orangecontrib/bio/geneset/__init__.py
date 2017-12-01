@@ -1,41 +1,18 @@
-from __future__ import absolute_import, with_statement
-
-try:
-    import cPickle as pickle
-except:
-    import pickle
+import pickle
+import os
+import tempfile
+import sys
+import datetime
+import re
 
 from urllib.request import urlopen
-    
-import os, tempfile, sys
 from collections import defaultdict
-import datetime
 
-from ..utils.serverfiles import localpath_download, listfiles
 from ..utils import serverfiles
+from ..utils import environ
+from .. import dicty
+from .. import go, omim, kegg, taxonomy
 
-import six
-
-try:
-    from Orange.utils import environ
-except ImportError:
-    from ..utils import environ
-
-try:
-    basestring
-except:
-    basestring = str
-
-from .. import go as obiGO, kegg as obiKEGG, taxonomy as obiTaxonomy
-from .. import dicty 
-obiDictyMutants = dicty.phenotypes
-from .. import omim as obiOMIM
-from .. import go as obiGO
-
-try:
-    from . import transform
-except:
-    pass  #not yet available in Orange3
 
 sfdomain = "gene_sets"
 
@@ -46,8 +23,8 @@ class NoGenesetsException(Exception): pass
 
 def goGeneSets(org):
     """Returns gene sets from GO."""
-    ontology = obiGO.Ontology()
-    annotations = obiGO.Annotations(org, ontology=ontology)
+    ontology = go.Ontology()
+    annotations = go.Annotations(org, ontology=ontology)
 
     genesets = []
     link_fmt = "http://amigo.geneontology.org/cgi-bin/amigo/term-details.cgi?term=%s"
@@ -67,16 +44,16 @@ def keggGeneSets(org):
     Returns gene sets from KEGG pathways.
     """
 
-    kegg = obiKEGG.KEGGOrganism(org)
+    kegg_org = kegg.KEGGOrganism(org)
 
     genesets = []
-    for id in kegg.pathways():
-        pway = obiKEGG.KEGGPathway(id)
+    for id in kegg_org.pathways():
+        pway = kegg.KEGGPathway(id)
         hier = ("KEGG","pathways")
         if pway.pathway_attributes():
             gs = GeneSet(id=id,
                                  name=pway.title,
-                                 genes=kegg.get_genes_by_pathway(id),
+                                 genes=kegg_org.get_genes_by_pathway(id),
                                  hierarchy=hier,
                                  organism=org,
                                  link=pway.link)
@@ -93,9 +70,9 @@ def dictyMutantSets():
     #                    link=(link_fmt % mutant.name if mutant.name else None)) \
     #                    for mutant in obiDictyMutants.mutants()]
  
-    genesets = [GeneSet(id=phenotype, name=phenotype, genes=[obiDictyMutants.mutant_genes(mutant)[0] for mutant in mutants], hierarchy=("Dictybase", "Phenotypes"), organism="352472", # 352472 gathered from obiGO.py code_map -> Dicty identifier
+    genesets = [GeneSet(id=phenotype, name=phenotype, genes=[dicty.phenotypes.mutant_genes(mutant)[0] for mutant in mutants], hierarchy=("Dictybase", "Phenotypes"), organism="352472", # 352472 gathered from obiGO.py code_map -> Dicty identifier
                         link="") \
-                        for phenotype, mutants in obiDictyMutants.phenotype_mutants().items()]
+                        for phenotype, mutants in dicty.phenotypes.phenotype_mutants().items()]
 
     return GeneSets(genesets)
 
@@ -135,42 +112,11 @@ def omimGeneSets():
     """
     Return gene sets from OMIM (Online Mendelian Inheritance in Man) diseses
     """
-    genesets = [GeneSet(id=disease.id, name=disease.name, genes=obiOMIM.disease_genes(disease), hierarchy=("OMIM",), organism="9606",
+    genesets = [GeneSet(id=disease.id, name=disease.name, genes=omim.disease_genes(disease), hierarchy=("OMIM",), organism="9606",
                     link=("http://www.omim.org/entry/%s" % disease.id if disease.id else None)) \
-                    for disease in obiOMIM.diseases()]
+                    for disease in omim.diseases()]
     return GeneSets(genesets)
 
-def miRNAGeneSets(org):
-    """
-    Return gene sets from miRNA targets
-    """
-    from .. import obimiRNA
-    org_code = obiKEGG.from_taxid(org)
-    link_fmt = "http://www.mirbase.org/cgi-bin/mirna_entry.pl?acc=%s"
-    mirnas = [(id, obimiRNA.get_info(id)) for id in obimiRNA.ids(org_code)]
-    genesets = [GeneSet(id=mirna.matACC, name=mirna.matID, genes=mirna.targets.split(","), hierarchy=("miRNA", "Targets"),
-                        organism=org, link=link_fmt % mirna.matID) for id, mirna in mirnas]
-    return GeneSets(genesets)
-
-def go_miRNASets(org, ontology=None, enrichment=True, pval=0.05, treshold=0.04):
-    from .. import obimiRNA
-    mirnas = obimiRNA.ids(int(org))
-    if ontology is None:
-        ontology = obiGO.Ontology()
-
-    annotations = obiGO.Annotations(org, ontology=ontology)
-
-    go_sets = obimiRNA.get_GO(mirnas, annotations, enrichment=enrichment, pval=pval, goSwitch=False)
-
-    go_sets = obimiRNA.filter_GO(go_sets, annotations, treshold=treshold)
-
-    link_fmt = "http://amigo.geneontology.org/cgi-bin/amigo/term-details.cgi?term=%s"
-    gsets = [GeneSet(id=key, name=ontology[key].name, genes=value, hierarchy=("miRNA", "go_sets",),
-                        organism=org, link=link_fmt % key) for key, value in go_sets.items()]
-    gset = GeneSets(gsets)
-    return gset
-
-import re
 
 linkre = re.compile("(.*?)\s?(?:\[(https?://[^[^\]]*)\])?$")
 
@@ -288,10 +234,7 @@ def list_serverfiles_conn(serverfiles=None):
 
 def list_serverfiles():
     fname = serverfiles.localpath_download(sfdomain, "index.pck")
-    if six.PY3:
-        flist = pickle.load(open(fname, 'rb'), encoding="latin1")
-    else:
-        flist = pickle.load(open(fname, 'rb'))
+    flist = pickle.load(open(fname, 'rb'), encoding="latin1")
     return list_serverfiles_from_flist(flist)
 
 def list_all(org=None, local=None):
@@ -360,11 +303,11 @@ def _register_serverfiles(genesets, serverFiles):
     tfname = pickle_temp(genesets)
     try:
         if org != None:
-            taxname = obiTaxonomy.name(org)
+            taxname = taxonomy.name(org)
             title = "Gene sets: " + ", ".join(hierarchy) + ((" (" + taxname + ")") if org is not None else "")
             tags = list(hierarchy) + ["gene sets"] +\
-                ([taxname] if org is not None else []) + obiTaxonomy.shortname(org) +\
-                (["essential"] if org in obiTaxonomy.essential_taxids() else [])
+                ([taxname] if org is not None else []) + taxonomy.shortname(org) +\
+                (["essential"] if org in taxonomy.essential_taxids() else [])
             with open(tfname, 'rb') as f:
                 serverFiles.register_sets(sfdomain, fn, f.read(), title, tags)
     finally:
@@ -411,10 +354,8 @@ def load_fn(hierarchy, organism, fnlist, fnget):
         raise NoGenesetsException(exstr)
     for (h, o) in [ files[i] for i in hierd[(hierarchy, organism)]]:
         fname = fnget(h, o)
-        if six.PY3:
-            out.update(pickle.load(open(fname, 'rb'), encoding="latin1"))
-        else:
-            out.update(pickle.load(open(fname, 'rb')))
+        out.update(pickle.load(open(fname, 'rb'), encoding="latin1"))
+
     return out
 
 def load(hierarchy, organism):
@@ -424,7 +365,7 @@ def load(hierarchy, organism):
         try:
             int(organism) #already a taxid
         except:
-            organismc = obiTaxonomy.to_taxid(strornone(organism))
+            organismc = taxonomy.to_taxid(strornone(organism))
             if len(organismc) == 1:
                 organism = organismc.pop()
             else:
@@ -467,7 +408,7 @@ def collections(*args):
 
 def issequencens(x):
     "Is x a sequence and not string ? We say it is if it has a __getitem__ method and it is not an instance of basestring."
-    return hasattr(x, '__getitem__') and not isinstance(x, basestring)
+    return hasattr(x, '__getitem__') and not isinstance(x, str)
 
 class TException(Exception): pass
 
@@ -480,11 +421,10 @@ def upload_genesets(rsf):
     [rsf.sf_local.localpath_download(domain, file) for domain, file in rsf.sf_server.listfiles('GO')]
     [rsf.sf_local.localpath_download(domain, file) for domain, file in rsf.sf_server.listfiles('OMIM')]
     [rsf.sf_local.localpath_download(domain, file) for domain, file in rsf.sf_server.listfiles('dictybase')]
-    [rsf.sf_local.localpath_download(domain, file) for domain, file in rsf.sf_server.listfiles('miRNA')]
 
-    genesetsfn = [goGeneSets, keggGeneSets, miRNAGeneSets, omimGeneSets, dictyMutantSets,
+    genesetsfn = [goGeneSets, keggGeneSets, omimGeneSets, dictyMutantSets,
                   cytobandGeneSets, reactomePathwaysGeneSets]
-    organisms = obiTaxonomy.common_taxids()
+    organisms = taxonomy.common_taxids()
     for fn in genesetsfn:
         for org in organisms:
             try:
@@ -497,7 +437,7 @@ def upload_genesets(rsf):
                     print("registering %s" % str(gs.common_hierarchy()))
                     register(gs, serverFiles=rsf) #server files register(gs)
                     print("successful %s" % str(gs.common_hierarchy()))
-            except obiTaxonomy.UnknownSpeciesIdentifier:
+            except taxonomy.UnknownSpeciesIdentifier:
                 print("Organism ontology not available %s" % org)
             except GenesetRegException:
                 print("Empty gene sets. %s" % org)

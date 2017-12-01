@@ -1,10 +1,5 @@
-from __future__ import absolute_import
-from __future__ import division
-
-import sys
 import os
 import time
-import re
 import zlib
 import sqlite3
 import socket
@@ -13,20 +8,9 @@ import pickle
 
 from functools import reduce
 from collections import defaultdict
-
-if sys.version_info < (3, ):
-    from urllib2 import urlopen
-    from urllib import urlencode
-    from urllib2 import HTTPError
-    from itertools import izip
-else:
-    from urllib.request import urlopen
-    from urllib.parse import urlencode
-    from urllib.error import HTTPError
-    izip = zip
-
-import six
-import numpy
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from urllib.error import HTTPError
 
 try:
     #for 2.7.9+ and 3.4.3+
@@ -35,7 +19,6 @@ try:
 except AttributeError:
     CONTEXT = None
 
-import Orange
 
 from ..utils.compat import *
 from ..utils import serverfiles
@@ -142,7 +125,7 @@ def issequencens(x):
     Is x a sequence and not string ? We say it is if it has a __getitem__ 
     method and it is not an instance of six.string_types.
     """
-    return hasattr(x, '__getitem__') and not isinstance(x, six.string_types)
+    return hasattr(x, '__getitem__') and not isinstance(x, str)
 
 #end utility functions
 
@@ -176,11 +159,10 @@ def httpGet(address, *args, **kwargs):
     if verbose:
         print("bytes", len(read))
         print(time.time() - t1)
-    if six.PY3:
-        encoding = f.headers.get_content_charset("latin-1")
-        return read.decode(encoding)
-    else:
-        return read
+
+    encoding = f.headers.get_content_charset("latin-1")
+    return read.decode(encoding)
+
 
 def txt2ll(s, separ=' ', lineSepar='\n'):
     return [ a.split(separ) for a in s.split(lineSepar) ]
@@ -355,7 +337,7 @@ class DBCommon(object):
         """
         callback = kwargs.pop("callback", None)
         odic = {}
-        for a,b in izip(ids, fn(*args, **kwargs)):
+        for a,b in zip(ids, fn(*args, **kwargs)):
             odic[a] = b
             if callback: callback()
         return odic
@@ -395,7 +377,7 @@ class DBCommon(object):
         sids = split(ids,chunk)
     
         bufverfn = None
-        if isinstance(bufver, six.string_types):
+        if isinstance(bufver, str):
             bufverfn = lambda x: bufver
         else:
             bufverfn = bufver
@@ -806,7 +788,7 @@ Can only retrieve a single result_template_type at a time"""
         sids = split(ids, chunk)
 
         bufverfn = None
-        if isinstance(bufver, six.string_types):
+        if isinstance(bufver, str):
             bufverfn = lambda x: bufver
         else:
             bufverfn = bufver
@@ -1013,7 +995,7 @@ chips chips""")
             ids = nth(antss.items(),0)
             antss = zip(nth(antss.items(),1), [ legend ]*len(antss))
 
-        for ants in izip(antss,ids):
+        for ants in zip(antss,ids):
             (res, legend), id = ants
             res2 = onlyColumns(res, legend, ['name', 'value'])
             res2 = [ [ self.aoidtr(a),b ] for a,b in res2 ]
@@ -1334,7 +1316,7 @@ def createExampleTable(names, vals, annots, ddb, cname="DDB", \
 
     examples = [ None ]*len(ddb)
     ddbs = [ None ]*len(ddb)
-    for i,(v,d) in enumerate(izip(izip(*vals), ddb)):
+    for i,(v,d) in enumerate(zip(zip(*vals), ddb)):
         ex = [ encode_unknown(a) for a in v ]
 
         if permutation:

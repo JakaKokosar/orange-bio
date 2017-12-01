@@ -1,24 +1,16 @@
-from __future__ import absolute_import, division
-
 import numpy
-
 import Orange
 import scipy.stats
 
-try:
-    from Orange.data import Variable, ContinuousVariable, DiscreteVariable
-except ImportError:
-    Variable = Orange.feature.Descriptor
-    DiscreteVariable = Orange.feature.Discrete
-    ContinuousVariable = Orange.feature.Continuous
-   
+
+from Orange.data import Variable, ContinuousVariable, DiscreteVariable
 from numpy import median
 from functools import reduce
 
-#import statc #was used for betai and mannwhhithenyu
 
 def mean(l):
     return float(sum(l))/len(l)
+
 
 class MA_pearsonCorrelation:
     """
@@ -30,6 +22,7 @@ class MA_pearsonCorrelation:
         data2 = Orange.data.Table(dom2, data)
         a,c = data2.toNumpy("A/C")
         return numpy.corrcoef(c,a[:,0])[0,1]
+
 
 class MA_signalToNoise:
     """
@@ -87,11 +80,14 @@ class MA_signalToNoise:
             #TODO rather throw exception? 
             return 0
 
+
 class MA_t_test(object):
+
     def __init__(self, a=None, b=None, prob=False):
         self.a = a
         self.b = b
         self.prob = prob
+
     def __call__(self, i, data):
         cv = data.domain.class_var
         #print data.domain
@@ -116,10 +112,13 @@ class MA_t_test(object):
         except:
             return 1.0 if self.prob else 0.0
 
+
 class MA_fold_change(object):
+
     def __init__(self, a=None, b=None):
         self.a = a
         self.b = b
+
     def __call__(self, i, data):
         cv = data.domain.class_var
         #print data.domain
@@ -144,8 +143,10 @@ class MA_fold_change(object):
             return 1
 
 class MA_anova(object):
+
     def __init__(self, prob=False):
         self.prob = prob
+
     def __call__(self, i, data):
         cv = data.domain.class_var
         #print data.domain
@@ -168,6 +169,7 @@ class MA_anova(object):
 
 import numpy as np
 import numpy.ma as ma
+
 
 class ExpressionSignificance_Test(object):
     def __new__(cls, data, useAttributeLabels, **kwargs):
@@ -783,16 +785,6 @@ def MA_center_lowess_fast(G, R, f=2./3., iter=1, resolution=100, progressCallbac
     Gc[valid] *= numpy.exp2(centered)
     Gc.mask, R.mask = ~valid, ~valid
     return Gc, R
-
-
-def MA_plot(G, R, format="b."):
-    """ Plot G, R on a MA-plot using matplotlib
-    """
-    import matplotlib.pyplot as plt
-    ratio, intensity = ratio_intensity(G, R)
-    plt.plot(intensity, ratio, format)
-    plt.ylabel('M = log2(R/G')
-    plt.xlabel('A = log10(R*G)')
 
 
 def normalize_expression_data(data, groups, axis=1, merge_function=numpy.ma.average, center_function=MA_center_lowess_fast):

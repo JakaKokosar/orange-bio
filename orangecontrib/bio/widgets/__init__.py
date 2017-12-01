@@ -2,15 +2,27 @@
 Bioinformatics
 ==============
 
+Bioinformatics widgets for Orange3
+
 """
 
 NAME = "Bioinformatics"
 
-ICON = "icons/Category-Bioinformatics.svg"
+ICON = "../widgets/icons/Category-Bioinformatics.svg"
 
 BACKGROUND = "light-grass"
 
 intersphinx = (
     ("{DEVELOP_ROOT}/docs/build/html/", None),
-    ("http://orange-bioinformatics.readthedocs.org/en/latest/", None)
+    ("http://pythonhosted.org/Orange-Bioinformatics/", None)
+)
+
+WIDGET_HELP_PATH = (
+    # Used for development.
+    # You still need to build help pages using
+    # make htmlhelp
+    # inside doc folder
+    ("{DEVELOP_ROOT}/doc/build/htmlhelp/index.html", None),
+
+    ("http://pythonhosted.org/Orange-Bioinformatics/", "")
 )

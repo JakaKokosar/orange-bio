@@ -4,14 +4,8 @@ obiKEGG2 configuration
 mostly just caching settings
 
 """
-from __future__ import absolute_import
-
 import os
-
-try:
-    import ConfigParser as configparser
-except ImportError:
-    import configparser
+import configparser
 
 from six import StringIO
 from ..utils import serverfiles

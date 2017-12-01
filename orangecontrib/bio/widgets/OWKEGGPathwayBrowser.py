@@ -1,57 +1,42 @@
 """
-<name>KEGG Pathways</name>
-<description>Browse KEGG pathways that include an input set of genes.</description>
-<priority>2030</priority>
-<icon>icons/KEGGPathways.svg</icon>
-"""
+KEGG Pathway
+------------
 
-from __future__ import absolute_import, with_statement
+"""
 
 import sys
 import gc
 import webbrowser
 from operator import add, itemgetter
+from functools import reduce, partial
 from contextlib import contextmanager
 
-from PyQt4.QtGui import (
-    QTreeWidget, QTreeWidgetItem, QItemSelectionModel, QSplitter,
-    QAction, QMenu, QGraphicsView, QGraphicsScene, QFont,
-    QBrush, QColor, QPen, QTransform, QPainter, QPainterPath,
-    QGraphicsItem, QGraphicsPathItem, QGraphicsPixmapItem, QPixmap,
-    QMessageBox, QKeySequence
-)
+import numpy
 
-from PyQt4.QtCore import (
-    Qt, QObject, QMetaObject, QTimer, Q_ARG, QRectF, SIGNAL, pyqtSlot
+from AnyQt.QtWidgets import (
+    QTreeWidget, QTreeWidgetItem, QSplitter, QAction, QMenu,
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsPathItem,
+    QGraphicsPixmapItem
 )
+from AnyQt.QtGui import (
+    QBrush, QColor, QPen, QTransform, QPainter, QPainterPath, QPixmap,
+    QKeySequence
+)
+from AnyQt.QtCore import Qt, QRectF, QSize, Slot, QItemSelectionModel
 
 import Orange
 
 from orangecontrib.bio.utils import serverfiles
-from Orange.orng.orngDataCaching import data_hints
+from Orange.widgets.utils.datacaching import data_hints
 
-from Orange.OrangeWidgets import OWGUI
-from Orange.OrangeWidgets.OWWidget import *
-from Orange.OrangeWidgets.OWItemModels import VariableListModel
-from Orange.OrangeWidgets.OWConcurrent import \
-    ThreadExecutor, Task, methodinvoke
+from Orange.widgets import widget, gui, settings
+from Orange.widgets.utils import itemmodels, concurrent
 
+from orangecontrib.bio import kegg
+from orangecontrib.bio import geneset
+from orangecontrib.bio.utils import stats
 
-from .. import kegg
-from .. import geneset
-
-
-NAME = "KEGG Pathways"
-DESCRIPTION = "Browse KEGG pathways that include an input set of genes."
-ICON = "icons/KEGGPathways.svg"
-PRIORITY = 2030
-
-INPUTS = [("Examples", Orange.data.Table, "SetData", Default),
-          ("Reference", Orange.data.Table, "SetRefData")]
-OUTPUTS = [("Selected Examples", Orange.data.Table, Default),
-           ("Unselected Examples", Orange.data.Table)]
-
-REPLACES = ["_bioinformatics.widgets.OWKEGGPathwayBrowser.OWKEGGPathwayBrowser"]
+from .OWMapManOntology import relation_list_to_multimap
 
 
 def split_and_strip(string, sep=None):
@@ -140,7 +125,7 @@ class GraphicsPathwayItem(QGraphicsPixmapItem):
                 continue
             graphics = entry.graphics
             contained_objects = [obj for obj in objects if obj in entry.name]
-            item = EntryGraphicsItem(graphics, self, self.scene())
+            item = EntryGraphicsItem(graphics, self)
             item.setToolTip(self.tooltip(entry, contained_objects,
                                          name_mapper))
             item._actions = self.actions(entry, contained_objects)
@@ -158,17 +143,12 @@ class GraphicsPathwayItem(QGraphicsPixmapItem):
             genes = [s.split(":")[-1] for s in marked_objects]
             address = ("http://www.genome.jp/dbget-bin/www_bget?" +
                        "+".join([org] + genes))
-            action.connect(action,
-                           SIGNAL("triggered()"),
-                           lambda toggled=False, address=address:
-                               webbrowser.open(address))
+
+            action.triggered.connect(partial(webbrowser.open, address))
             actions.append(action)
         elif hasattr(entry, "link"):
             action = QAction("View %s on KEGG website" % str(type), None)
-            action.connect(action,
-                           SIGNAL("triggered()"),
-                           lambda toggled=False, address=entry.link: \
-                               webbrowser.open(address))
+            action.triggered.connect(partial(webbrowser.open, entry.link))
             actions.append(action)
         return actions
 
@@ -186,8 +166,8 @@ class GraphicsPathwayItem(QGraphicsPixmapItem):
         action = menu.addAction("View this pathway on KEGG website")
         address = ("http://www.kegg.jp/kegg-bin/show_pathway?%s%s" %
                    (self.pathway.org, self.pathway.number))
-        action.connect(action, SIGNAL("triggered()"),
-                       lambda: webbrowser.open(address))
+
+        action.triggered.connect(partial(webbrowser.open, address))
         menu.popup(event.screenPos())
 
 
@@ -201,7 +181,8 @@ class PathwayView(QGraphicsView):
 
         self.setRenderHints(QPainter.Antialiasing)
         scene = QGraphicsScene(self)
-        self.pixmapGraphicsItem = QGraphicsPixmapItem(None, scene)
+        self.pixmapGraphicsItem = QGraphicsPixmapItem(None)
+        scene.addItem(self.pixmapGraphicsItem)
         self.setScene(scene)
 
         self.setMouseTracking(True)
@@ -233,119 +214,93 @@ class PathwayView(QGraphicsView):
         else:
             self.setTransform(QTransform())
 
-    def paintEvent(self, event):
-        QGraphicsView.paintEvent(self, event)
-        if getattr(self, "_userMessage", None):
-            painter = QPainter(self.viewport())
-            font = QFont(self.font())
-            font.setPointSize(15)
-            painter.setFont(font)
-            painter.drawText(self.viewport().geometry(), Qt.AlignCenter,
-                             self._userMessage)
-            painter.end()
 
+class OWKEGGPathwayBrowser(widget.OWWidget):
+    name = "KEGG Pathways"
+    description = "Browse KEGG pathways that include an input set of genes."
+    icon = "../widgets/icons/KEGGPathways.svg"
+    priority = 2030
 
-class OWKEGGPathwayBrowser(OWWidget):
-    settingsList = ["organismIndex", "geneAttrIndex", "autoCommit",
-                    "autoResize", "useReference", "useAttrNames",
-                    "showOrthology"]
+    inputs = [("Data", Orange.data.Table, "SetData", widget.Default),
+              ("Reference", Orange.data.Table, "SetRefData")]
+    outputs = [("Selected Data", Orange.data.Table, widget.Default),
+               ("Unselected Data", Orange.data.Table)]
 
-    contextHandlers = {
-        "": DomainContextHandler(
-            "",
-            [ContextField("organismIndex",
-                          DomainContextHandler.Required +
-                          DomainContextHandler.IncludeMetaAttributes),
-             ContextField("geneAttrIndex",
-                          DomainContextHandler.Required +
-                          DomainContextHandler.IncludeMetaAttributes),
-             ContextField("useAttrNames",
-                          DomainContextHandler.Required +
-                          DomainContextHandler.IncludeMetaAttributes)]
-        )
-    }
+    settingsHandler = settings.DomainContextHandler()
 
-    def __init__(self, parent=None, signalManager=None, name="KEGG Pathways"):
-        OWWidget.__init__(self, parent, signalManager, name, wantGraph=True)
-        self.inputs = [("Examples", Orange.data.Table, self.SetData),
-                       ("Reference", Orange.data.Table, self.SetRefData)]
-        self.outputs = [("Selected Examples", Orange.data.Table),
-                        ("Unselected Examples", Orange.data.Table)]
-        self.organismIndex = 0
-        self.geneAttrIndex = 0
-        self.autoCommit = False
-        self.autoResize = True
-        self.useReference = False
-        self.useAttrNames = 0
-        self.showOrthology = True
+    organismIndex = settings.ContextSetting(0)
+    geneAttrIndex = settings.ContextSetting(0)
+    useAttrNames = settings.ContextSetting(False)
 
-        self.loadSettings()
+    autoCommit = settings.Setting(False)
+    autoResize = settings.Setting(True)
+    useReference = settings.Setting(False)
+    showOrthology = settings.Setting(True)
+
+    Ready, Initializing, Running = 0, 1, 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
         self.organismCodes = []
         self._changedFlag = False
+        self.__invalidated = False
+        self.__runstate = OWKEGGPathwayBrowser.Initializing
+        self.__in_setProgress = False
 
         self.controlArea.setMaximumWidth(250)
-        box = OWGUI.widgetBox(self.controlArea, "Info")
-        self.infoLabel = OWGUI.widgetLabel(box, "No data on input\n")
+        box = gui.widgetBox(self.controlArea, "Info")
+        self.infoLabel = gui.widgetLabel(box, "No data on input\n")
 
         # Organism selection.
-        box = OWGUI.widgetBox(self.controlArea, "Organism")
-        self.organismComboBox = OWGUI.comboBox(
+        box = gui.widgetBox(self.controlArea, "Organism")
+        self.organismComboBox = gui.comboBox(
             box, self, "organismIndex",
             items=[],
             callback=self.Update,
             addSpace=True,
-            debuggingEnabled=0,
             tooltip="Select the organism of the input genes")
 
         # Selection of genes attribute
-        box = OWGUI.widgetBox(self.controlArea, "Gene attribute")
-        self.geneAttrCandidates = VariableListModel(parent=self)
-        self.geneAttrCombo = OWGUI.comboBox(
+        box = gui.widgetBox(self.controlArea, "Gene attribute")
+        self.geneAttrCandidates = itemmodels.VariableListModel(parent=self)
+        self.geneAttrCombo = gui.comboBox(
             box, self, "geneAttrIndex", callback=self.Update)
         self.geneAttrCombo.setModel(self.geneAttrCandidates)
 
-        OWGUI.checkBox(box, self, "useAttrNames",
-                       "Use variable names",
-                       disables=[(-1, self.geneAttrCombo)],
-                       callback=self.Update)
+        gui.checkBox(box, self, "useAttrNames",
+                    "Use variable names", disables=[(-1, self.geneAttrCombo)],
+                    callback=self.Update)
 
         self.geneAttrCombo.setDisabled(bool(self.useAttrNames))
 
-        OWGUI.separator(self.controlArea)
+        gui.separator(self.controlArea)
 
-        OWGUI.checkBox(self.controlArea, self, "useReference",
-                       "From signal",
-                       box="Reference",
-                       callback=self.Update)
+        gui.checkBox(self.controlArea, self, "useReference",
+                    "From signal", box="Reference", callback=self.Update)
 
-        OWGUI.separator(self.controlArea)
+        gui.separator(self.controlArea)
 
-        OWGUI.checkBox(self.controlArea, self, "showOrthology",
-                       "Show pathways in full orthology",
-                       box="Orthology",
-                       callback=self.UpdateListView)
+        gui.checkBox(self.controlArea, self, "showOrthology",
+                     "Show pathways in full orthology", box="Orthology",
+                     callback=self.UpdateListView)
 
-        OWGUI.checkBox(self.controlArea, self, "autoResize",
-                       "Resize to fit",
-                       box="Image",
-                       callback=self.UpdatePathwayViewTransform)
+        gui.checkBox(self.controlArea, self, "autoResize",
+                     "Resize to fit", box="Image",
+                     callback=self.UpdatePathwayViewTransform)
 
-        box = OWGUI.widgetBox(self.controlArea, "Cache Control")
+        box = gui.widgetBox(self.controlArea, "Cache Control")
 
-        OWGUI.button(box, self, "Clear cache",
-                     callback=self.ClearCache,
-                     tooltip="Clear all locally cached KEGG data.")
+        gui.button(box, self, "Clear cache",
+                   callback=self.ClearCache,
+                   tooltip="Clear all locally cached KEGG data.",
+                   default=False, autoDefault=False)
 
-        OWGUI.separator(self.controlArea)
+        gui.separator(self.controlArea)
 
-        box = OWGUI.widgetBox(self.controlArea, "Selection")
-        cb = OWGUI.checkBox(box, self, "autoCommit", "Commit on update")
-        button = OWGUI.button(box, self, "Commit", callback=self.Commit,
-                              default=True)
-        OWGUI.setStopper(self, button, cb, "_changedFlag", self.Commit)
+        gui.auto_commit(self.controlArea, self, "autoCommit", "Commit")
 
-        OWGUI.rubber(self.controlArea)
+        gui.rubber(self.controlArea)
 
         spliter = QSplitter(Qt.Vertical, self.mainArea)
         self.pathwayView = PathwayView(self, spliter)
@@ -354,27 +309,19 @@ class OWKEGGPathwayBrowser(OWWidget):
         )
         self.mainArea.layout().addWidget(spliter)
 
-        self.listView = QTreeWidget(spliter)
+        self.listView = QTreeWidget(
+            allColumnsShowFocus=True,
+            selectionMode=QTreeWidget.SingleSelection,
+            sortingEnabled=True,
+            maximumHeight=200)
+
         spliter.addWidget(self.listView)
 
-        self.listView.setAllColumnsShowFocus(1)
         self.listView.setColumnCount(4)
-        self.listView.setHeaderLabels(["Pathway", "P value",
-                                       "Genes", "Reference"])
+        self.listView.setHeaderLabels(
+            ["Pathway", "P value", "Genes", "Reference"])
 
-        self.listView.setSelectionMode(QTreeWidget.SingleSelection)
-
-        self.listView.setSortingEnabled(True)
-
-        self.listView.setMaximumHeight(200)
-
-        self.connect(self.listView,
-                     SIGNAL("itemSelectionChanged()"),
-                     self.UpdatePathwayView)
-
-        self.connect(self.graphButton,
-                     SIGNAL("clicked()"),
-                     self.saveGraph)
+        self.listView.itemSelectionChanged.connect(self.UpdatePathwayView)
 
         select = QAction(
             "Select All", self,
@@ -386,42 +333,10 @@ class OWKEGGPathwayBrowser(OWWidget):
         self.data = None
         self.refData = None
 
-        self.resize(800, 600)
-
-        self.connect(self,
-                     SIGNAL("widgetStateChanged(QString, int, QString)"),
-                     self.onStateChange)
-
-        self.has_new_data = False
-        self.has_new_reference_set = False
-
-        self._executor = ThreadExecutor()
+        self._executor = concurrent.ThreadExecutor()
         self.setEnabled(False)
         self.setBlocking(True)
-        QTimer.singleShot(0, self._initialize)
-        self.infoLabel.setText("Fetching organism definitions\n")
-
-    def _initialize(self):
-        # First try to import slumber to see if we can even use the
-        # kegg module.
-        try:
-            import slumber
-        except ImportError:
-            QMessageBox.warning(self,
-                "'slumber' library required.",
-                '<p>Please install '
-                '<a href="http://pypi.python.org/pypi/slumber">slumber</a> '
-                'library to use KEGG Pathways widget.</p>'
-            )
-            self.infoLabel.setText(
-                '<p>Please install '
-                '<a href="http://pypi.python.org/pypi/slumber">slumber</a> '
-                'library to use KEGG Pathways widget.</p>'
-            )
-            self.error(0, "Missing slumber/requests library")
-            return
-
-        progress = methodinvoke(self, "setProgress", (float,))
+        progress = concurrent.methodinvoke(self, "setProgress", (float,))
 
         def get_genome():
             """Return a KEGGGenome with the common org entries precached."""
@@ -437,24 +352,31 @@ class OWKEGGPathwayBrowser(OWWidget):
             # TODO: Add option to specify additional organisms not
             # in the common list.
 
-            keys = map(genome.org_code_to_entry_key, essential + common)
+            keys = list(map(genome.org_code_to_entry_key, essential + common))
 
             genome.pre_cache(keys, progress_callback=progress)
             return (keys, genome)
 
-        self._genomeTask = task = Task(function=get_genome)
-        task.finished.connect(self._initializeOrganisms)
+        self._genomeTask = task = concurrent.Task(function=get_genome)
+        task.finished.connect(self.__initialize_finish)
 
         self.progressBarInit()
+        self.infoLabel.setText("Fetching organism definitions\n")
         self._executor.submit(task)
 
-    def _initializeOrganisms(self):
-        self.progressBarFinished()
+    def __initialize_finish(self):
+        if self.__runstate != OWKEGGPathwayBrowser.Initializing:
+            return
+
         try:
             keys, genome = self._genomeTask.result()
         except Exception as err:
             self.error(0, str(err))
-            return
+            raise
+
+        self.progressBarFinished()
+        self.setEnabled(True)
+        self.setBlocking(False)
 
         entries = [genome[key] for key in keys]
         items = [entry.definition for entry in entries]
@@ -465,8 +387,6 @@ class OWKEGGPathwayBrowser(OWWidget):
         self.organismComboBox.addItems(items)
         self.organismComboBox.setCurrentIndex(self.organismIndex)
 
-        self.setEnabled(True)
-        self.setBlocking(False)
         self.infoLabel.setText("No data on input\n")
 
     def Clear(self):
@@ -486,10 +406,13 @@ class OWKEGGPathwayBrowser(OWWidget):
         self.listView.clear()
         self.pathwayView.SetPathway(None)
 
-        self.send("Selected Examples", None)
-        self.send("Unselected Examples", None)
+        self.send("Selected Data", None)
+        self.send("Unselected Data", None)
 
     def SetData(self, data=None):
+        if self.__runstate == OWKEGGPathwayBrowser.Initializing:
+            self.__initialize_finish()
+
         self.closeContext()
         self.data = data
         self.warning(0)
@@ -497,17 +420,20 @@ class OWKEGGPathwayBrowser(OWWidget):
         self.information(0)
 
         if data is not None:
-            vars = data.domain.variables + data.domain.getmetas().values()
+            vars = data.domain.variables + data.domain.metas
             vars = [var for var in vars
-                    if isinstance(var, (Orange.feature.String,
-                                        Orange.feature.Discrete))]
+                    if isinstance(var, Orange.data.StringVariable)]
             self.geneAttrCandidates[:] = vars
 
             # Try to guess the gene name variable
-            names_lower = [v.name.lower() for v in vars]
-            scores = [(name == "gene", "gene" in name)
-                      for name in names_lower]
-            imax, _ = max(enumerate(scores), key=itemgetter(1))
+            if vars:
+                names_lower = [v.name.lower() for v in vars]
+                scores = [(name == "gene", "gene" in name)
+                          for name in names_lower]
+                imax, _ = max(enumerate(scores), key=itemgetter(1))
+            else:
+                imax = -1
+
             self.geneAttrIndex = imax
 
             taxid = data_hints.get_hint(data, "taxid", None)
@@ -516,30 +442,34 @@ class OWKEGGPathwayBrowser(OWWidget):
                     code = kegg.from_taxid(taxid)
                     self.organismIndex = self.organismCodes.index(code)
                 except Exception as ex:
-                    print ex, taxid
+                    print(ex, taxid)
 
             self.useAttrNames = data_hints.get_hint(data, "genesinrows",
                                                     self.useAttrNames)
+            self.openContext(data)
 
-            self.openContext("", data)
+            if len(self.geneAttrCandidates) == 0:
+                self.useAttrNames = True
+                self.geneAttrIndex = -1
+            else:
+                self.geneAttrIndex = min(self.geneAttrIndex,
+                                         len(self.geneAttrCandidates) - 1)
         else:
             self.Clear()
 
-        self.has_new_data = True
+        self.__invalidated = True
 
     def SetRefData(self, data=None):
         self.refData = data
         self.information(1)
 
-        self.has_new_reference_set = True
+        if data is not None and self.useReference:
+            self.__invalidated = True
 
     def handleNewSignals(self):
-        if self.has_new_data or (self.has_new_reference_set and \
-                                 self.useReference):
+        if self.__invalidated:
             self.Update()
-
-            self.has_new_data = False
-            self.has_new_reference_set = False
+            self.__invalidated = False
 
     def UpdateListView(self):
         self.bestPValueItem = None
@@ -621,7 +551,7 @@ class OWKEGGPathwayBrowser(OWWidget):
         else:
             self.listView.setRootIsDecorated(False)
             pathways = self.pathways.items()
-            pathways.sort(lambda a, b: cmp(a[1][1], b[1][1]))
+            pathways = sorted(pathways, key=lambda item: item[1][1])
 
             for id, (genes, p_value, ref) in pathways:
                 item = QTreeWidgetItem(self.listView)
@@ -651,7 +581,7 @@ class OWKEGGPathwayBrowser(OWWidget):
         else:
             item = None
 
-        self.Commit()
+        self.commit()
         item = item or self.bestPValueItem
         if not item or not item.pathway_id:
             self.pathwayView.SetPathway(None)
@@ -665,7 +595,7 @@ class OWKEGGPathwayBrowser(OWWidget):
             return (pathway_id, p)
 
         self.setEnabled(False)
-        self._pathwayTask = Task(
+        self._pathwayTask = concurrent.Task(
             function=lambda: get_kgml_and_image(item.pathway_id)
         )
         self._pathwayTask.finished.connect(self._onPathwayTaskFinshed)
@@ -745,14 +675,12 @@ class OWKEGGPathwayBrowser(OWWidget):
             # We use the kegg pathway gene sets provided by 'geneset' for
             # the enrichment calculation.
 
-            # Ensure we are using the latest genesets
-            # TODO: ?? Is updating the index enough?
-            serverfiles.update(geneset.sfdomain, "index.pck")
-            kegg_gs_collections = geneset.collections(
-                (("KEGG", "pathways"), taxid)
-            )
+            kegg_api = kegg.api.CachedKeggApi()
+            linkmap = kegg_api.link(org.org_code, "pathway")
+            kegg_sets = relation_list_to_multimap(linkmap)
+            kegg_sets = geneset.GeneSets(input=kegg_sets)
             pathways = pathway_enrichment(
-                kegg_gs_collections, unique_genes.keys(),
+                kegg_sets, unique_genes.keys(),
                 unique_ref_genes.keys(),
                 callback=progress
             )
@@ -769,8 +697,8 @@ class OWKEGGPathwayBrowser(OWWidget):
         self.setEnabled(False)
         self.infoLabel.setText("Retrieving...\n")
 
-        progress = methodinvoke(self, "setProgress", (float,))
-        self._enrichTask = Task(
+        progress = concurrent.methodinvoke(self, "setProgress", (float,))
+        self._enrichTask = concurrent.Task(
             function=lambda:
                 run_enrichment(org_code, genes, reference, progress)
         )
@@ -780,13 +708,13 @@ class OWKEGGPathwayBrowser(OWWidget):
     def _onEnrichTaskFinished(self):
         self.setEnabled(True)
         self.setBlocking(False)
-
-        self.progressBarFinished()
         try:
             pathways, org, unique_genes, unique_ref_genes = \
                 self._enrichTask.result()
         except Exception:
             raise
+
+        self.progressBarFinished()
 
         self.org = org
         self.genes = unique_genes.keys()
@@ -811,9 +739,14 @@ class OWKEGGPathwayBrowser(OWWidget):
 
         self.UpdateListView()
 
-    @pyqtSlot(float)
+    @Slot(float)
     def setProgress(self, value):
-        self.progressBarValue = value
+        if self.__in_setProgress:
+            return
+
+        self.__in_setProgress = True
+        self.progressBarSet(value)
+        self.__in_setProgress = False
 
     def GeneNamesFromData(self, data):
         """
@@ -822,10 +755,10 @@ class OWKEGGPathwayBrowser(OWWidget):
         if self.useAttrNames:
             genes = [str(v.name).strip() for v in data.domain.attributes]
         elif self.geneAttrCandidates:
-            index = min(self.geneAttrIndex, len(self.geneAttrCandidates) - 1)
-            geneAttr = self.geneAttrCandidates[index]
+            assert 0 <= self.geneAttrIndex < len(self.geneAttrCandidates)
+            geneAttr = self.geneAttrCandidates[self.geneAttrIndex]
             genes = [str(e[geneAttr]) for e in data
-                     if not e[geneAttr].isSpecial()]
+                     if not numpy.isnan(e[geneAttr])]
         else:
             raise ValueError("No gene names in data.")
         return genes
@@ -854,12 +787,9 @@ class OWKEGGPathwayBrowser(OWWidget):
 
     def _onSelectionChanged(self):
         # Item selection in the pathwayView/scene has changed
-        if self.autoCommit:
-            self.Commit()
-        else:
-            self._changedFlag = True
+        self.commit()
 
-    def Commit(self):
+    def commit(self):
         if self.data:
             selectedItems = self.pathwayView.scene().selectedItems()
             selectedGenes = reduce(set.union, [item.marked_objects
@@ -867,68 +797,56 @@ class OWKEGGPathwayBrowser(OWWidget):
                                    set())
 
             if self.useAttrNames:
-                selectedVars = [self.data.domain[self.uniqueGenesDict[gene]]
-                                for gene in selectedGenes]
-                newDomain = Orange.data.Domain(selectedVars, 0)
-                data = Orange.data.Table(newDomain, self.data)
-                self.send("Selected Examples", data)
+                selected = [self.data.domain[self.uniqueGenesDict[gene]]
+                            for gene in selectedGenes]
+#                 newDomain = Orange.data.Domain(selectedVars, 0)
+                data = self.data[:, selected]
+#                 data = Orange.data.Table(newDomain, self.data)
+                self.send("Selected Data", data)
             elif self.geneAttrCandidates:
-                geneAttr = self.geneAttrCandidates[min(self.geneAttrIndex,
-                                                       len(self.geneAttrCandidates) - 1)]
-                selectedExamples = []
-                otherExamples = []
-                for ex in self.data:
+                assert 0 <= self.geneAttrIndex < len(self.geneAttrCandidates)
+                geneAttr = self.geneAttrCandidates[self.geneAttrIndex]
+                selectedIndices = []
+                otherIndices = []
+                for i, ex in enumerate(self.data):
                     names = [self.revUniqueGenesDict.get(name, None)
                              for name in split_and_strip(str(ex[geneAttr]), ",")]
                     if any(name and name in selectedGenes for name in names):
-                        selectedExamples.append(ex)
+                        selectedIndices.append(i)
                     else:
-                        otherExamples.append(ex)
+                        otherIndices.append(i)
 
-                if selectedExamples:
-                    selectedExamples = Orange.data.Table(selectedExamples)
+                if selectedIndices:
+                    selected = self.data[selectedIndices]
                 else:
-                    selectedExamples = None
+                    selected = None
 
-                if otherExamples:
-                    otherExamples = Orange.data.Table(otherExamples)
+                if otherIndices:
+                    other = self.data[otherIndices]
                 else:
-                    otherExamples = None
+                    other = None
 
-                self.send("Selected Examples", selectedExamples)
-                self.send("Unselected Examples", otherExamples)
+                self.send("Selected Data", selected)
+                self.send("Unselected Data", other)
         else:
-            self.send("Selected Examples", None)
-            self.send("Unselected Examples", None)
+            self.send("Selected Data", None)
+            self.send("Unselected Data", None)
 
     def ClearCache(self):
-        from ..kegg import caching
-        try:
-            caching.clear_cache()
-        except Exception, ex:
-            QMessageBox.warning(self, "Cache clear", ex.args[0])
-
-    def onStateChange(self, stateType, id, text):
-        if stateType == "Warning":
-            self.pathwayView._userMessage = text
-            self.pathwayView.viewport().update()
-
-    def saveGraph(self):
-        from Orange.OrangeWidgets.OWDlgs import OWChooseImageSizeDlg
-        sizeDlg = OWChooseImageSizeDlg(self.pathwayView.scene(), parent=self)
-        sizeDlg.exec_()
+        kegg.caching.clear_cache()
 
     def onDeleteWidget(self):
         """
         Called before the widget is removed from the canvas.
         """
+        super().onDeleteWidget()
+
         self.org = None
-        gc.collect()  # Force collection
-
         self._executor.shutdown(wait=False)
+        gc.collect()  # Force collection (WHY?)
 
-
-from ..utils import stats
+    def sizeHint(self):
+        return QSize(1024, 720)
 
 
 def pathway_enrichment(genesets, genes, reference, prob=None, callback=None):
@@ -977,15 +895,28 @@ def disconnected(signal, slot):
         signal.connect(slot)
 
 
-if __name__ == "__main__":
+def test_main(argv=sys.argv):
+    from AnyQt.QtWidgets import QApplication
     app = QApplication(sys.argv)
+
+    if len(argv) > 1:
+        filename = argv[1]
+    else:
+        filename = "brown-selected"
+    data = Orange.data.Table(filename)
+
     w = OWKEGGPathwayBrowser()
     w.show()
+    w.raise_()
 
-    data = Orange.data.Table("brown-selected.tab")
+    w.SetData(data)
+    w.handleNewSignals()
 
-    QTimer.singleShot(3000, lambda: w.SetData(data))
-    QTimer.singleShot(3500, w.handleNewSignals)
-
-    app.exec_()
+    r = app.exec_()
     w.saveSettings()
+    w.onDeleteWidget()
+    return r
+
+
+if __name__ == "__main__":
+    sys.exit(test_main())

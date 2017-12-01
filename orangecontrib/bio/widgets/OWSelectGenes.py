@@ -3,75 +3,44 @@ import os
 import re
 import unicodedata
 import operator
+import math
 from collections import defaultdict, namedtuple
 from operator import itemgetter
+from functools import reduce
 from xml.sax.saxutils import escape
 
 from contextlib import contextmanager
 
-from PyQt4.QtGui import (
-    QFrame, QHBoxLayout, QPlainTextEdit, QSyntaxHighlighter, QTextCharFormat,
-    QTextCursor, QCompleter, QStandardItemModel, QSortFilterProxyModel,
-    QStandardItem, QListView, QTreeView, QStyle, QStyledItemDelegate,
-    QStyleOptionViewItemV4, QPalette, QColor, QApplication, QAction,
-    QToolButton, QItemSelectionModel, QPlainTextDocumentLayout, QTextDocument,
-    QRadioButton, QButtonGroup, QStyleOptionButton, QMenu, QDialog,
-    QStackedWidget, QComboBox, QFileDialog
+from AnyQt.QtWidgets import (
+    QFrame, QHBoxLayout, QPlainTextEdit, QPlainTextDocumentLayout,
+    QCompleter, QListView, QTreeView, QAction, QToolButton, QRadioButton,
+    QButtonGroup, QMenu, QDialog, QStackedWidget, QComboBox, QFileDialog,
+    QStyle, QStyledItemDelegate, QStyleOptionViewItem, QStyleOptionButton,
+    QApplication
 )
-
-from PyQt4.QtCore import Qt, QEvent, QVariant, QThread
-from PyQt4.QtCore import pyqtSignal as Signal
+from AnyQt.QtGui import (
+    QSyntaxHighlighter, QTextCursor, QTextCharFormat, QTextDocument,
+    QStandardItemModel, QStandardItem, QPalette, QColor
+)
+from AnyQt.QtCore import QSortFilterProxyModel, QItemSelectionModel
+from AnyQt.QtCore import Qt, QEvent, QThread, Signal
 
 import Orange
 
-from Orange.OrangeWidgets.OWWidget import (
-    OWWidget, DomainContextHandler, Default
-)
-
-from Orange.OrangeWidgets.OWConcurrent import (
+from Orange.widgets import widget, settings, gui
+from Orange.widgets.utils.concurrent import (
     ThreadExecutor, Task, methodinvoke
 )
 
-from Orange.OrangeWidgets.OWItemModels import VariableListModel
-from Orange.OrangeWidgets import OWGUI
-from Orange.orng.orngDataCaching import data_hints
-from Orange.bio import obiGene as geneinfo
-from Orange.bio import obiTaxonomy as taxonomy
+from Orange.widgets.utils.itemmodels import VariableListModel
+from Orange.widgets.utils.datacaching import data_hints
 
-
-NAME = "Select Genes"
-DESCRIPTION = "Select a specified subset of the input genes."
-ICON = "icons/SelectGenes.svg"
-
-INPUTS = [("Data", Orange.data.Table, "setData", Default),
-          ("Gene Subset", Orange.data.Table, "setGeneSubset")]
-
-OUTPUTS = [("Selected Data", Orange.data.Table)]
-
-
-def toString(variant):
-    if isinstance(variant, QVariant):
-        return unicode(variant.toString())
-    else:
-        return unicode(variant)
-
-
-def toBool(variant):
-    if isinstance(variant, QVariant):
-        return bool(variant.toPyObject())
-    else:
-        return bool(variant)
-
-
-def toPyObject(variant):
-    if isinstance(variant, QVariant):
-        return variant.toPyObject()
-    else:
-        return variant
+from orangecontrib.bio import taxonomy
+from orangecontrib.bio import gene as geneinfo
 
 
 class SaveSlot(QStandardItem):
-    ModifiedRole = next(OWGUI.OrangeUserRole)
+    ModifiedRole = next(gui.OrangeUserRole)
 
     def __init__(self, name, savedata=None, modified=False):
         super(SaveSlot, self).__init__(name)
@@ -82,11 +51,11 @@ class SaveSlot(QStandardItem):
 
     @property
     def name(self):
-        return unicode(self.text())
+        return self.text()
 
     @property
     def modified(self):
-        return toBool(self.data(SaveSlot.ModifiedRole))
+        return bool(self.data(SaveSlot.ModifiedRole))
 
     @modified.setter
     def modified(self, state):
@@ -96,10 +65,10 @@ class SaveSlot(QStandardItem):
 class SavedSlotDelegate(QStyledItemDelegate):
 
     def paint(self, painter, option, index):
-        option = QStyleOptionViewItemV4(option)
+        option = QStyleOptionViewItem(option)
         self.initStyleOption(option, index)
 
-        modified = toBool(index.data(SaveSlot.ModifiedRole))
+        modified = bool(index.data(SaveSlot.ModifiedRole))
         if modified:
             option.palette.setColor(QPalette.Text, QColor(Qt.red))
             option.palette.setColor(QPalette.Highlight, QColor(Qt.darkRed))
@@ -125,44 +94,41 @@ def radio_indicator_width(button):
     return w
 
 
-class OWSelectGenes(OWWidget):
+class OWSelectGenes(widget.OWWidget):
 
-    contextHandlers = {
-        "": DomainContextHandler(
-            "", ["geneIndex", "taxid"]
-        ),
-        "subset": DomainContextHandler(
-            "subset", ["subsetGeneIndex"]
-        )
-    }
-
-    settingsList = ["autoCommit", "preserveOrder", "savedSelections",
-                    "selectedSelectionIndex", "selectedSource",
-                    "completeOnSymbols"]
+    name = "Select Genes"
+    description = "Select a specified subset of the input genes."
+    icon = "../widgets/icons/SelectGenes.svg"
+    inputs = [("Data", Orange.data.Table, "setData", widget.Default),
+              ("Gene Subset", Orange.data.Table, "setGeneSubset")]
+    outputs = [("Selected Data", Orange.data.Table)]
 
     SelectInput, SelectCustom = 0, 1
     CompletionRole = Qt.UserRole + 1
 
-    def __init__(self, parent=None, signalManager=None, title=NAME):
-        OWWidget.__init__(self, parent, signalManager, title,
-                          wantMainArea=False)
+    settingsHandler = settings.DomainContextHandler()
 
-        self.geneIndex = None
-        self.taxid = None
-        self.autoCommit = False
-        self.preserveOrder = True
-        self.savedSelections = [
-            ("Example", ["MRE11A", "RAD51", "MLH1", "MSH2", "DMC1"])
-        ]
+    geneIndex = settings.ContextSetting(0)
+    taxid = settings.ContextSetting(None)
+    subsetGeneIndex = settings.ContextSetting(-1)
 
-        self.selectedSelectionIndex = -1
-        self.selectedSource = OWSelectGenes.SelectCustom
-        self.completeOnSymbols = True
+    savedSelections = settings.Setting([
+        ("Example", ["MRE11A", "RAD51", "MLH1", "MSH2", "DMC1"])
+    ])
+    selectedSource = settings.Setting(SelectCustom)
+    selectedSelectionIndex = settings.Setting(-1)
+    completeOnSymbols = settings.Setting(True)
 
-        self.loadSettings()
+    autoCommit = settings.Setting(False)
+    preserveOrder = settings.Setting(True)
+
+    want_main_area = False
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
         # Input variables that could contain names
-        self.variables = VariableListModel()
+        self.variables = VariableListModel(parent=self)
         # All gene names and their symbols
         self.geneNames = []
         # A list of (name, info) where name is from the input
@@ -177,9 +143,9 @@ class OWSelectGenes(OWWidget):
         self.data = None
         self.subsetData = None
         # Input variables that could contain gene names from "Gene Subset"
-        self.subsetVariables = VariableListModel()
+        self.subsetVariables = VariableListModel(parent=self)
         # Selected subset variable index
-        self.subsetGeneIndex = -1
+
         self.organisms = []
         self.taxidindex = {}
         self.geneinfo = (None, None)
@@ -187,15 +153,15 @@ class OWSelectGenes(OWWidget):
 
         self._infotask = None
 
-        box = OWGUI.widgetBox(self.controlArea, "Gene Attribute")
+        box = gui.widgetBox(self.controlArea, "Gene Attribute")
         box.setToolTip("Column with gene names")
-        self.attrsCombo = OWGUI.comboBox(
+        self.attrsCombo = gui.comboBox(
             box, self, "geneIndex",
             callback=self._onGeneIndexChanged,
         )
         self.attrsCombo.setModel(self.variables)
 
-        box = OWGUI.widgetBox(self.controlArea, "Gene Selection")
+        box = gui.widgetBox(self.controlArea, "Gene Selection")
 
         button1 = QRadioButton("Select genes from 'Gene Subset' input")
         button2 = QRadioButton("Select specified genes")
@@ -203,14 +169,15 @@ class OWSelectGenes(OWWidget):
         box.layout().addWidget(button1)
 
         # Subset gene variable selection
-        self.subsetbox = OWGUI.widgetBox(box, None)
+        self.subsetbox = gui.widgetBox(box, None)
         offset = radio_indicator_width(button1)
         self.subsetbox.layout().setContentsMargins(offset, 0, 0, 0)
         self.subsetbox.setEnabled(
             self.selectedSource == OWSelectGenes.SelectInput)
 
-        box1 = OWGUI.widgetBox(self.subsetbox, "Gene Attribute", flat=True)
-        self.subsetVarCombo = OWGUI.comboBox(
+        box1 = gui.widgetBox(self.subsetbox, "Gene Attribute")
+        box1.setFlat(True)
+        self.subsetVarCombo = gui.comboBox(
             box1, self, "subsetGeneIndex",
             callback=self._onSubsetGeneIndexChanged
         )
@@ -218,10 +185,10 @@ class OWSelectGenes(OWWidget):
         self.subsetVarCombo.setToolTip(
             "Column with gene names in the 'Gene Subset' input"
         )
-        OWGUI.button(box1, self, "Copy genes to saved subsets",
+        gui.button(box1, self, "Copy genes to saved subsets",
                      callback=self.copyToSaved)
 
-        OWGUI.button(box1, self, "Append genes to current saved selection",
+        gui.button(box1, self, "Append genes to current saved selection",
                      callback=self.appendToSelected)
 
         box.layout().addWidget(button2)
@@ -236,14 +203,15 @@ class OWSelectGenes(OWWidget):
         else:
             button2.setChecked(True)
 
-        self.entrybox = OWGUI.widgetBox(box, None)
+        self.entrybox = gui.widgetBox(box, None)
         offset = radio_indicator_width(button2)
         self.entrybox.layout().setContentsMargins(offset, 0, 0, 0)
 
         self.entrybox.setEnabled(
             self.selectedSource == OWSelectGenes.SelectCustom)
 
-        box = OWGUI.widgetBox(self.entrybox, "Select Genes", flat=True)
+        box = gui.widgetBox(self.entrybox, "Select Genes")
+        box.setFlat(True)
         box.setToolTip("Enter gene names to select")
         box.layout().setSpacing(1)
 
@@ -254,7 +222,7 @@ class OWSelectGenes(OWWidget):
 
         box.layout().addWidget(self.entryField)
 
-        completer = ListCompleter()
+        completer = ListCompleter(self)
         completer.setCompletionMode(QCompleter.PopupCompletion)
         completer.setCompletionRole(
             self.CompletionRole if self.completeOnSymbols else Qt.DisplayRole
@@ -273,7 +241,7 @@ class OWSelectGenes(OWWidget):
         popup.header().hide()
 
         completer.setPopup(popup)
-        completer.setModel(SetFilterProxyModel(self))
+        completer.setModel(SetFilterProxyModel())
 
         self.entryField.setCompleter(completer)
 
@@ -311,9 +279,8 @@ class OWSelectGenes(OWWidget):
             "Complete on gene symbol names", self,
             toolTip="Use symbol names for auto completion.",
             checkable=True,
-            checked=self.completeOnSymbols
         )
-
+        self.completeOnSymbolsAction.setChecked(self.completeOnSymbols)
         self.completeOnSymbolsAction.toggled[bool].connect(
             self._onToggleSymbolCompletion
         )
@@ -351,11 +318,12 @@ class OWSelectGenes(OWWidget):
 
         box.layout().addWidget(toolbar)
 
-        box = OWGUI.widgetBox(self.entrybox, "Saved Selections", flat=True)
+        box = gui.widgetBox(self.entrybox, "Saved Selections")
+        box.setFlat(True)
         box.setToolTip("Save/Select/Update saved gene selections")
         box.layout().setSpacing(1)
 
-        self.selectionsModel = QStandardItemModel()
+        self.selectionsModel = QStandardItemModel(self)
         self.selectionsView = QListView()
         self.selectionsView.setAlternatingRowColors(True)
         self.selectionsView.setModel(self.selectionsModel)
@@ -375,7 +343,7 @@ class OWSelectGenes(OWWidget):
             toolTip="Create a new saved selection")
 
         self.actionRemove = QAction(
-            u"\u2212", self,
+            "\u2212", self,
             toolTip="Delete the current saved selection")
 
         toolbar = QFrame()
@@ -401,15 +369,15 @@ class OWSelectGenes(OWWidget):
         self.actionAdd.triggered.connect(self.addSelection)
         self.actionRemove.triggered.connect(self.removeSelection)
 
-        box = OWGUI.widgetBox(self.controlArea, "Output")
-        OWGUI.checkBox(box, self, "preserveOrder", "Preserve input order",
-                       tooltip="Preserve the order of the input data "
-                               "instances.",
-                       callback=self.invalidateOutput)
-        cb = OWGUI.checkBox(box, self, "autoCommit", "Auto commit")
-        button = OWGUI.button(box, self, "Commit", callback=self.commit)
-
-        OWGUI.setStopper(self, button, cb, "_changedFlag", self.commit)
+        box = gui.widgetBox(self.controlArea, "Output")
+        gui.checkBox(box, self, "preserveOrder", "Preserve input order",
+                     tooltip="Preserve the order of the input data "
+                             "instances.",
+                     callback=self.invalidateOutput)
+        gui.auto_commit(box, self, "autoCommit", "Commit", box=None)
+#         cb = gui.checkBox(box, self, "autoCommit", "Auto commit")
+#         button = gui.button(box, self, "Commit", callback=self.commit)
+#         gui.setStopper(self, button, cb, "_changedFlag", self.commit)
 
         # Gene set import dialog (initialized when required)
         self._genesetDialog = None
@@ -492,7 +460,7 @@ class OWSelectGenes(OWWidget):
         """
         Set the input data.
         """
-        self.closeContext("")
+        self.closeContext()
         self.warning(0)
         self.data = data
         if data is not None:
@@ -516,7 +484,7 @@ class OWSelectGenes(OWWidget):
         else:
             self.taxid = None
 
-        self.openContext("", data)
+        self.openContext(data)
 
         if self.taxid is None:
             self.geneinfo = (None, None)
@@ -536,7 +504,9 @@ class OWSelectGenes(OWWidget):
         """
         Set the gene subset input.
         """
-        self.closeContext("subset")
+        # TODO: In Orange 2 we had two context handlers. This is no
+        # longer possible in Orange3.
+#         self.closeContext("subset")
         self.warning(1)
         self.subsetData = data
         if data is not None:
@@ -552,7 +522,7 @@ class OWSelectGenes(OWWidget):
             self.subsetVariables[:] = []
             self.subsetGeneIndex = -1
 
-        self.openContext("subset", data)
+#         self.openContext("subset", data)
 
         if self.selectedSource == OWSelectGenes.SelectInput:
             self.commit()
@@ -587,15 +557,15 @@ class OWSelectGenes(OWWidget):
 
     def selectedGenes(self):
         """
-        Return the names of the current selected genes.
+        Return the names of the currently selected genes.
         """
         selection = []
         if self.selectedSource == OWSelectGenes.SelectInput:
             var = self.subsetGeneVar
             if var is not None:
+                assert isinstance(var, Orange.data.StringVariable)
                 values = [inst[var] for inst in self.subsetData]
-                selection = [str(val) for val in values
-                             if not val.is_special()]
+                selection = [str(val) for val in values if not math.isnan(val)]
         else:
             selection = self.selection
         return selection
@@ -609,9 +579,7 @@ class OWSelectGenes(OWWidget):
         if self.geneinfo[1] is not None:
             backmap = dict((info.symbol, name) for name, info in self.genes
                            if info is not None)
-            names = set([name for name, _ in self.genes])
             selection = [backmap.get(name, name) for name in selection]
-    
         if self.geneVar is not None:
             data = select_by_genes(self.data, self.geneVar,
                                    gene_list=selection,
@@ -640,8 +608,14 @@ class OWSelectGenes(OWWidget):
     def _updateCompletionModel(self):
         var = self.geneVar
         if var is not None:
-            names = [str(inst[var]) for inst in self.data
-                     if not inst[var].is_special()]
+            assert isinstance(var, Orange.data.StringVariable)
+            names, _ = self.data.get_column_view(var)
+            if names.dtype == object:
+                names = [name for name in names if isinstance(name, str)]
+            elif names.dtype.kind in ["U", "S"]:
+                names = [str(name) for name in names]
+            else:
+                raise TypeError
         else:
             names = []
 
@@ -654,7 +628,7 @@ class OWSelectGenes(OWWidget):
             infodict = dict(info)
 
         names = sorted(set(names))
-        genes = zip(names, map(infodict.get, names))
+        genes = list(zip(names, map(infodict.get, names)))
 
         symbols = [info.symbol for _, info in genes if info is not None]
 
@@ -677,6 +651,7 @@ class OWSelectGenes(OWWidget):
 
         self.geneNames = sorted(set(names) | set(symbols))
         self.genes = genes
+
         self.entryField.completer().model().setSourceModel(model)
         self.entryField.document().highlighter.setNames(names + symbols)
 
@@ -835,11 +810,10 @@ class OWSelectGenes(OWWidget):
             self.entryField.moveCursor(QTextCursor.End)
 
     def importFromFile(self):
-        filename = QFileDialog.getOpenFileName(
+        filename, _ = QFileDialog.getOpenFileName(
             self, "Open File", os.path.expanduser("~/"))
 
         if filename:
-            filename = unicode(filename)
             with open(filename, "rU") as f:
                 text = f.read()
             self.entryField.appendPlainText(text)
@@ -893,38 +867,38 @@ class OWSelectGenes(OWWidget):
 
         return OWWidget.getSettings(self, *args, **kwargs)
 
-    def sendReport(self):
-        report = []
-        if self.data is not None:
-            report.append("%i instances on input." % len(self.data))
-        else:
-            report.append("No data on input.")
-
-        if self.geneVar is not None:
-            report.append("Gene names taken from %r attribute." %
-                          escape(self.geneVar.name))
-
-        self.reportSection("Input")
-        self.startReportList()
-        for item in report:
-            self.addToReportList(item)
-        self.finishReportList()
-        report = []
-        selection = self.selectedGenes()
-        if self.selectedSource == OWSelectGenes.SelectInput:
-            self.reportRaw(
-                "<p>Gene Selection (from 'Gene Subset' input): %s</p>" %
-                escape(" ".join(selection))
-            )
-        else:
-            self.reportRaw(
-                "<p>Gene Selection: %s</p>" %
-                escape(" ".join(selection))
-            )
-        self.reportSettings(
-            "Settings",
-            [("Preserve order", self.preserveOrder)]
-        )
+#     def sendReport(self):
+#         report = []
+#         if self.data is not None:
+#             report.append("%i instances on input." % len(self.data))
+#         else:
+#             report.append("No data on input.")
+# 
+#         if self.geneVar is not None:
+#             report.append("Gene names taken from %r attribute." %
+#                           escape(self.geneVar.name))
+# 
+#         self.reportSection("Input")
+#         self.startReportList()
+#         for item in report:
+#             self.addToReportList(item)
+#         self.finishReportList()
+#         report = []
+#         selection = self.selectedGenes()
+#         if self.selectedSource == OWSelectGenes.SelectInput:
+#             self.reportRaw(
+#                 "<p>Gene Selection (from 'Gene Subset' input): %s</p>" %
+#                 escape(" ".join(selection))
+#             )
+#         else:
+#             self.reportRaw(
+#                 "<p>Gene Selection: %s</p>" %
+#                 escape(" ".join(selection))
+#             )
+#         self.reportSettings(
+#             "Settings",
+#             [("Preserve order", self.preserveOrder)]
+#         )
 
     def onDeleteWidget(self):
         self._inittask.future().cancel()
@@ -933,58 +907,48 @@ class OWSelectGenes(OWWidget):
             self._infotask.future().cancel()
 
         self._executor.shutdown(wait=True)
-        OWWidget.onDeleteWidget(self)
+        super().onDeleteWidget()
 
 
-def is_string(feature):
-    return isinstance(feature, Orange.feature.String)
+def is_string(var):
+    return isinstance(var, Orange.data.StringVariable)
 
 
 def domain_variables(domain):
     """
     Return all feature descriptors from the domain.
     """
-    vars = (domain.features +
-            domain.class_vars +
-            domain.getmetas().values())
-    return vars
+    return domain.variables + domain.metas
 
 
 def gene_candidates(data):
     """
     Return features that could contain gene names.
     """
-    vars = domain_variables(data.domain)
-    vars = filter(is_string, vars)
-    return vars
+    return list(filter(is_string, domain_variables(data.domain)))
 
 
 def select_by_genes(data, gene_feature, gene_list, preserve_order=True):
     if preserve_order:
         selection = set(gene_list)
-        sel = [inst for inst in data
+        sel = [i for i, inst in enumerate(data)
                if str(inst[gene_feature]) in selection]
     else:
         by_genes = defaultdict(list)
-        for inst in data:
-            by_genes[str(inst[gene_feature])].append(inst)
+        for i, inst in enumerate(data):
+            by_genes[str(inst[gene_feature])].append(i)
 
         sel = []
         for name in gene_list:
             sel.extend(by_genes.get(name, []))
 
-    if sel:
-        data = Orange.data.Table(data.domain, sel)
-    else:
-        data = Orange.data.Table(data.domain)
-
-    return data
+    return data.from_table(data.domain, data, sel)
 
 
 _CompletionState = namedtuple(
     "_CompletionState",
-    ["start",  # completion prefix start position
-     "pos",  # cursor position
+    ["start",   # completion prefix start position
+     "pos",     # cursor position
      "anchor"]  # anchor position (inline completion end)
 )
 
@@ -1048,10 +1012,10 @@ class ListTextEdit(QPlainTextEdit):
 
         QPlainTextEdit.keyPressEvent(self, event)
 
-        if not len(event.text()) or not is_printable(unicode(event.text())[0]):
+        if not len(event.text()) or not is_printable(event.text()[0]):
             return
 
-        text = unicode(self.toPlainText())
+        text = self.toPlainText()
         cursor = self.textCursor()
         pos = cursor.position()
 
@@ -1106,7 +1070,7 @@ class ListTextEdit(QPlainTextEdit):
             self._stopCompletion()
             return
 
-        text = unicode(self.toPlainText())
+        text = self.toPlainText()
         # Find the end of the word started by completion prefix
         word_end = len(text)
         for i in range(start, len(text)):
@@ -1125,7 +1089,7 @@ class ListTextEdit(QPlainTextEdit):
         if isinstance(item, list):
             completion = " ".join(item)
         else:
-            completion = unicode(item)
+            completion = item
 
         start, _, end = self._completionState
 
@@ -1146,9 +1110,8 @@ class ListTextEdit(QPlainTextEdit):
         model = self._completer.completionModel()
         column = self._completer.completionColumn()
         role = self._completer.completionRole()
-        items = [toString(model.index(i, column).data(role))
+        items = [str(model.index(i, column).data(role))
                  for i in range(model.rowCount())]
-
         if not items:
             return ""
 
@@ -1178,7 +1141,7 @@ class ListTextEdit(QPlainTextEdit):
         .. note:: The inline completion text is not included.
 
         """
-        text = unicode(self.toPlainText())
+        text = self.toPlainText()
         if self._completionState[0] != -1:
             # Remove the inline completion text
             _, pos, end = self._completionState
@@ -1186,15 +1149,15 @@ class ListTextEdit(QPlainTextEdit):
         return [item for item in text.split() if item.strip()]
 
 
-def view_adjust_column_sizes(view, maxWidth=None):
+def view_adjust_column_sizes(view, max_width=None):
     """
     Adjust view's column sizes to to contents.
     """
-    if maxWidth is None:
-        maxWidth = sys.maxint
+    if max_width is None:
+        max_width = sys.maxsize
 
     for col in range(view.model().columnCount()):
-        width = min(view.sizeHintForColumn(col), maxWidth)
+        width = min(view.sizeHintForColumn(col), max_width)
         view.setColumnWidth(col, width)
 
 
@@ -1232,7 +1195,6 @@ class NameHighlight(QSyntaxHighlighter):
         return set(self._names)
 
     def highlightBlock(self, text):
-        text = unicode(text)
         pattern = re.compile(r"\S+")
         for match in pattern.finditer(text):
             name = text[match.start(): match.end()]
@@ -1242,11 +1204,11 @@ class NameHighlight(QSyntaxHighlighter):
                 continue
 
             if name in self._names:
-                format = self._format
+                charfmt = self._format
             else:
-                format = self._unrecognized_format
+                charfmt = self._unrecognized_format
 
-            self.setFormat(match.start(), match_len, format)
+            self.setFormat(match.start(), match_len, charfmt)
 
 
 @contextmanager
@@ -1301,7 +1263,7 @@ class ListCompleter(QCompleter):
         role = self.completionRole()
         indexes = self.popup().selectionModel().selectedRows(column)
 
-        items = [toString(index.data(role)) for index in indexes]
+        items = [str(index.data(role)) for index in indexes]
 
         if self.popup().isVisible():
             self.popup().hide()
@@ -1330,7 +1292,7 @@ class SetFilterProxyModel(QSortFilterProxyModel):
         col = self.filterKeyColumn()
         var = model.data(model.index(row, col, parent),
                          self.filterRole())
-        var = toString(var)
+        var = str(var)
         return var in self._filterFixedSet
 
 
@@ -1352,18 +1314,15 @@ def is_printable(unichar):
     """
     return unicodedata.category(unichar) not in _control
 
-
-import sys
 import itertools
 
-from PyQt4.QtGui import (
-    QVBoxLayout, QLineEdit, QDialogButtonBox,
-    QProgressBar, QSizePolicy
+from AnyQt.QtWidgets import (
+    QVBoxLayout, QLineEdit, QDialogButtonBox, QProgressBar, QSizePolicy
 )
-
-from PyQt4.QtCore import QSize
-from Orange.bio import obiGeneSets as genesets
+from AnyQt.QtCore import QSize
+from orangecontrib.bio import geneset as genesets
 from orangecontrib.bio.utils import serverfiles
+
 
 class GeneSetView(QFrame):
     selectedOrganismChanged = Signal(str)
@@ -1404,7 +1363,7 @@ class GeneSetView(QFrame):
         self.gsview.setSortingEnabled(True)
         self.gsview.setUniformRowHeights(True)
         self.proxymodel = QSortFilterProxyModel(
-            filterKeyColumn=1, sortCaseSensitivity=Qt.CaseInsensitive
+            self, filterKeyColumn=1, sortCaseSensitivity=Qt.CaseInsensitive
         )
 
         self.gsview.setModel(self.proxymodel)
@@ -1461,7 +1420,7 @@ class GeneSetView(QFrame):
         rows = [self.proxymodel.mapToSource(row)
                 for row in selmod.selectedRows(1)]
         gsets = [model.data(row, Qt.UserRole) for row in rows]
-        return map(toPyObject, gsets)
+        return gsets
 
     def _updateGeneSetsModel(self):
         taxid = self._taxid
@@ -1517,7 +1476,7 @@ class GeneSetView(QFrame):
     def _on_organismSelected(self, index):
         if index != -1:
             item = self.orgcombo.model().item(index)
-            taxid = toString(item.data(Qt.UserRole))
+            taxid = str(item.data(Qt.UserRole))
             self.setCurrentOrganism(taxid)
 
     def _on_selectionChanged(self, *args):
@@ -1612,6 +1571,8 @@ class GeneSetDialog(QDialog):
 def test1():
     app = QApplication([])
     dlg = GeneSetDialog()
+    dlg.show()
+    dlg.raise_()
     dlg.exec_()
     del dlg
     app.processEvents()

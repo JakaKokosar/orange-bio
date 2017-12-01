@@ -7,11 +7,7 @@ import collections
 import textwrap
 
 from collections import namedtuple
-
-try:
-    from urllib2 import urlopen
-except ImportError:
-    from urllib.request import urlopen
+from urllib.request import urlopen
 
 import six
 

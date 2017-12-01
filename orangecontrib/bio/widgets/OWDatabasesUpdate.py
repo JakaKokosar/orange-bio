@@ -1,36 +1,40 @@
+import sys
+from collections import namedtuple
 from datetime import datetime
 from functools import partial
-from collections import namedtuple
 
-from PyQt4.QtCore import pyqtSignal as Signal, pyqtSlot as Slot
-
+from AnyQt.QtCore import (
+    Qt, QSize, QEvent, QObject, QThreadPool, QThread
+)
+from AnyQt.QtCore import Signal, Slot
+from AnyQt.QtWidgets import (
+    QWidget, QProgressBar, QTreeWidget, QTreeWidgetItem, QToolButton,
+    QCheckBox, QLabel, QLineEdit, QStyledItemDelegate,
+    QApplication, QAbstractItemView, QSizePolicy, QHBoxLayout
+)
 from serverfiles import LocalFiles, sizeformat as sizeof_fmt
+
 from orangecontrib.bio.utils import serverfiles
+from orangecontrib.bio.widgets.utils.gui import TokenListCompleter
 
+if sys.version_info < (3, ):
+    import Orange.OrangeWidgets.OWGUI as gui
+    from Orange.OrangeWidgets.OWWidget import OWWidget
+    from Orange.OrangeWidgets.OWConcurrent import ThreadExecutor, Task, methodinvoke
 
-from Orange.utils.environ import canvas_install_dir
-from Orange.OrangeWidgets.OWWidget import *
-from Orange.OrangeWidgets import OWGUIEx
-from Orange.OrangeWidgets.OWConcurrent import ThreadExecutor, Task, methodinvoke
+    def qunpack(qvariant):
+        return qvariant.toPyObject()
+else:
+    from Orange.widgets.widget import OWWidget
+    from Orange.widgets import gui
+    from Orange.widgets.utils.concurrent import ThreadExecutor, Task, methodinvoke
 
-
-NAME = "Databases"
-DESCRIPTION = "Updates local system biology databases."
-ICON = "icons/Databases.svg"
-PRIORITY = 10
-
-INPUTS = []
-OUTPUTS = []
+    def qunpack(obj):
+        return obj
 
 
 #: Update file item states
 AVAILABLE, CURRENT, OUTDATED, DEPRECATED = range(4)
-
-_icons_dir = os.path.join(canvas_install_dir, "icons")
-
-
-def icon(name):
-    return QIcon(os.path.join(_icons_dir, name))
 
 
 class ItemProgressBar(QProgressBar):
@@ -77,7 +81,8 @@ class UpdateOptionsWidget(QWidget):
         layout.addWidget(self.checkButton)
         self.setLayout(layout)
 
-        self.setMaximumHeight(30)
+        self.setMinimumHeight(20)
+        self.setMaximumHeight(20)
 
         self.state = -1
         self.setState(state)
@@ -105,7 +110,7 @@ class UpdateOptionsWidget(QWidget):
 
         try:
             self.checkButton.clicked.disconnect()   # Remove old signals if they exist
-        except:
+        except Exception:
             pass
 
         if not self.checkButton.isChecked():        # Switch signals if the file is present or not
@@ -122,20 +127,23 @@ class UpdateTreeWidgetItem(QTreeWidgetItem):
         The update item for display.
 
     """
-    STATE_STRINGS = {0: "not downloaded",
-                     1: "downloaded, current",
-                     2: "downloaded, needs update",
-                     3: "obsolete"}
+    STATE_STRINGS = {
+        0: "not downloaded",
+        1: "downloaded, current",
+        2: "downloaded, needs update",
+        3: "obsolete"
+    }
 
     #: A role for the state item data.
-    StateRole = OWGUI.OrangeUserRole.next()
+    StateRole = next(gui.OrangeUserRole)
 
     # QTreeWidgetItem stores the DisplayRole and EditRole as the same role,
     # so we can't use EditRole to store the actual item data, instead we use
     # custom role.
 
     #: A custom edit role for the item's data
-    EditRole2 = OWGUI.OrangeUserRole.next()
+    #: (QTreeWidget treats Qt.EditRole as a alias for Qt.DisplayRole)
+    EditRole2 = next(gui.OrangeUserRole)
 
     def __init__(self, item):
         QTreeWidgetItem.__init__(self, type=QTreeWidgetItem.UserType)
@@ -145,10 +153,10 @@ class UpdateTreeWidgetItem(QTreeWidgetItem):
 
     def setUpdateItem(self, item):
         """
-        Set the update item for display.
+        Set the update item to display.
 
         :param UpdateItem item:
-            The update item for display.
+            The update item to display.
 
         """
         self.item = item
@@ -202,8 +210,16 @@ class UpdateTreeWidgetItem(QTreeWidgetItem):
         else:
             role = self.EditRole2
 
-        left = self.data(column, role).toPyObject()
-        right = other.data(column, role).toPyObject()
+        left = qunpack(self.data(column, role))
+        right = qunpack(other.data(column, role))
+        try:
+            return left < right
+        except TypeError:
+            pass
+        # order lexically by str representation, but ensure `None`
+        # always orders on one side
+        left = (0, "") if left is None else (1, str(left))
+        right = (0, "") if right is None else (1, str(right))
         return left < right
 
 
@@ -359,38 +375,45 @@ def retrieveFilesList(advance=lambda: None):
     """
     import requests.exceptions
     advance()
+
     try:
         serverInfo = serverfiles.ServerFiles().allinfo()
-    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-        raise requests.exceptions.ConnectionError
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        raise ConnectionError
+
     advance()
     return serverInfo
 
 
+class OWDatabasesUpdate(OWWidget):
 
-class OWUpdateGenomicsDatabases(OWWidget):
+    name = "Databases Update"
+    description = "Update local systems biology databases."
+    icon = "../widgets/icons/Databases.svg"
+    priority = 10
 
-    def __init__(self, parent=None, signalManager=None, wantCloseButton=False, showAll=True):
+    inputs = []
+    outputs = []
 
-        OWWidget.__init__(self, parent, signalManager, wantMainArea=False)
+    want_main_area = False
+
+    def __init__(self, parent=None, signalManager=None,
+                 name="Databases update"):
+        OWWidget.__init__(self, parent, signalManager, name,
+                          wantMainArea=False)
 
         self.searchString = ""
-        self.showAll = showAll
 
-        self.serverFiles = serverfiles.ServerFiles()
+        fbox = gui.widgetBox(self.controlArea, "Filter")
+        self.completer = TokenListCompleter(
+            self, caseSensitivity=Qt.CaseInsensitive)
+        self.lineEditFilter = QLineEdit(textChanged=self.SearchUpdate)
+        self.lineEditFilter.setCompleter(self.completer)
 
-        box = OWGUI.widgetBox(self.controlArea, orientation="horizontal")
+        fbox.layout().addWidget(self.lineEditFilter)
 
-        self.lineEditFilter = \
-            OWGUIEx.lineEditHint(box, self, "searchString", "Filter",
-                                 caseSensitive=False,
-                                 delimiters=" ",
-                                 matchAnywhere=True,
-                                 listUpdateCallback=self.SearchUpdate,
-                                 callbackOnType=True,
-                                 callback=self.SearchUpdate)
+        box = gui.widgetBox(self.controlArea, "Files")
 
-        box = OWGUI.widgetBox(self.controlArea, "Files")
         self.filesView = QTreeWidget(self)
         self.filesView.setHeaderLabels(
             ["", "Data Source", "Update", "Last Updated", "Size"])
@@ -403,35 +426,38 @@ class OWUpdateGenomicsDatabases(OWWidget):
         self.filesView.setItemDelegateForColumn(
             0, UpdateOptionsItemDelegate(self.filesView))
 
-        QObject.connect(self.filesView.model(),
-                        SIGNAL("layoutChanged()"),
-                        self.SearchUpdate)
+        self.filesView.model().layoutChanged.connect(self.SearchUpdate)
+
         box.layout().addWidget(self.filesView)
 
-        box = OWGUI.widgetBox(self.controlArea, orientation="horizontal")
-        self.updateButton = OWGUI.button(box, self, "Update all",
-                     callback=self.UpdateAll,
-                     tooltip="Update all updatable files",
-                     )
+        box = gui.widgetBox(self.controlArea, orientation="horizontal")
+        self.updateButton = gui.button(
+            box, self, "Update all",
+            callback=self.UpdateAll,
+            tooltip="Update all updatable files",
+         )
 
-        self.downloadButton = OWGUI.button(box, self, "Download all",
-                     callback=self.DownloadFiltered,
-                     tooltip="Download all filtered files shown")
-        self.cancelButton = OWGUI.button(box, self, "Cancel", callback=self.Cancel,
-                     tooltip="Cancel scheduled downloads/updates.")
-        OWGUI.rubber(box)
+        self.downloadButton = gui.button(
+            box, self, "Download all",
+            callback=self.DownloadFiltered,
+            tooltip="Download all filtered files shown"
+        )
 
-        self.retryButton = OWGUI.button(box, self, "Retry",
-                                        callback=self.RetrieveFilesList)
+        self.cancelButton = gui.button(
+            box, self, "Cancel", callback=self.Cancel,
+            tooltip="Cancel scheduled downloads/updates."
+        )
 
+        self.retryButton = gui.button(
+            box, self, "Reconnect", callback=self.RetrieveFilesList
+        )
         self.retryButton.hide()
 
-        box = OWGUI.widgetBox(self.controlArea, orientation="horizontal")
-        OWGUI.rubber(box)
-        if wantCloseButton:
-            OWGUI.button(box, self, "Close",
-                         callback=self.accept,
-                         tooltip="Close")
+        gui.rubber(box)
+        self.warning(0)
+
+        box = gui.widgetBox(self.controlArea, orientation="horizontal")
+        gui.rubber(box)
 
         self.infoLabel = QLabel()
         self.infoLabel.setAlignment(Qt.AlignCenter)
@@ -458,8 +484,9 @@ class OWUpdateGenomicsDatabases(OWWidget):
         self._haveProgress = False
 
     def RetrieveFilesList(self):
+        self.retryButton.hide()
+        self.warning(0)
         self.progress.setRange(0, 3)
-        self.serverFiles = serverfiles.ServerFiles()
 
         task = Task(function=partial(retrieveFilesList, methodinvoke(self.progress, "advance")))
 
@@ -476,8 +503,7 @@ class OWUpdateGenomicsDatabases(OWWidget):
         """
         self.setEnabled(True)
 
-        localInfo = LocalFiles(serverfiles.PATH).allinfo()
-
+        localInfo = serverfiles.allinfo()
         all_tags = set()
 
         self.filesView.clear()
@@ -510,7 +536,8 @@ class OWUpdateGenomicsDatabases(OWWidget):
                 button = QToolButton(
                     None, text="Update",
                     maximumWidth=120,
-                    maximumHeight=30
+                    minimumHeight=20,
+                    maximumHeight=20
                 )
 
                 if sys.platform == "darwin":
@@ -533,8 +560,8 @@ class OWUpdateGenomicsDatabases(OWWidget):
             width = max(min(contents_hint, 400), header_hint)
             self.filesView.setColumnWidth(column, width)
 
-        self.lineEditFilter.setItems([hint for hint in sorted(all_tags)
-                                      if not hint.startswith("#")])
+        hints = [hint for hint in sorted(all_tags) if not hint.startswith("#")]
+        self.completer.setTokenList(hints)
         self.SearchUpdate()
         self.UpdateInfoLabel()
         self.toggleButtons()
@@ -556,19 +583,20 @@ class OWUpdateGenomicsDatabases(OWWidget):
         self.buttonCheck(selected_items, AVAILABLE, self.downloadButton)
 
     def HandleError(self, exception):
-        if isinstance(exception, IOError):
-            self.error(0,
-                       "Could not connect to server! Press the Retry "
-                       "button to try again.")
+        if isinstance(exception, ConnectionError):
+            self.warning(0,
+                       "Could not connect to server! Check your connection "
+                       "and try to reconnect.")
             self.SetFilesList({})
+            self.retryButton.show()
         else:
-            sys.excepthook(type(exception), exception.args, None)
+            sys.excepthook(type(exception), exception, None)
             self.progress.setRange(0, 0)
             self.setEnabled(True)
 
     def UpdateInfoLabel(self):
         local = [item for item, tree_item, _ in self.updateItems
-                 if item.state != AVAILABLE and not tree_item.isHidden() ]
+                 if item.state != AVAILABLE and not tree_item.isHidden()]
         size = sum(float(item.size) for item in local)
 
         onServer = [item for item, tree_item, _ in self.updateItems if not tree_item.isHidden()]
@@ -583,6 +611,7 @@ class OWUpdateGenomicsDatabases(OWWidget):
         self.infoLabel.setText(text)
 
     def UpdateAll(self):
+        self.warning(0)
         for item, tree_item, _ in self.updateItems:
             if item.state == OUTDATED and not tree_item.isHidden():
                 self.SubmitDownloadTask(item.domain, item.filename)
@@ -595,7 +624,7 @@ class OWUpdateGenomicsDatabases(OWWidget):
                 self.SubmitDownloadTask(item.domain, item.filename)
 
     def SearchUpdate(self, searchString=None):
-        strings = unicode(self.lineEditFilter.text()).split()
+        strings = str(self.lineEditFilter.text()).split()
         for item, tree_item, _ in self.updateItems:
             hide = not all(UpdateItem_match(item, string)
                            for string in strings)
@@ -613,10 +642,7 @@ class OWUpdateGenomicsDatabases(OWWidget):
         _, tree_item, opt_widget = self.updateItems[index]
 
         sf = LocalFiles(serverfiles.PATH, serverfiles.ServerFiles())
-
         task = DownloadTask(domain, filename, sf)
-
-        self.executor.submit(task)
 
         self.progress.adjustRange(0, 100)
 
@@ -640,6 +666,8 @@ class OWUpdateGenomicsDatabases(OWWidget):
         opt_widget.setEnabled(False)
         self._tasks.append(task)
 
+        self.executor.submit(task)
+
     def EndDownloadTask(self, task):
         future = task.future()
         index = self.updateItemIndex(task.domain, task.filename)
@@ -658,12 +686,30 @@ class OWUpdateGenomicsDatabases(OWWidget):
             opt_widget.setState(item.state)
 
             # Show the exception string in the size column.
-            tree_item.setData(2, Qt.DisplayRole,
-                         QVariant("Error occurred while downloading:" +
-                                  str(future.exception())))
+            self.warning(0, "Error while downloading. Check your connection "
+                            "and retry.")
+
+            # recreate button for download
+            button = QToolButton(
+                None, text="Retry",
+                maximumWidth=120,
+                minimumHeight=20,
+                maximumHeight=20
+            )
+
+            if sys.platform == "darwin":
+                button.setAttribute(Qt.WA_MacSmallSize)
+
+            button.clicked.connect(
+                partial(self.SubmitDownloadTask, item.domain,
+                        item.filename)
+            )
+
+            self.filesView.setItemWidget(tree_item, 2, button)
 
         else:
             # get the new updated info dict and replace the the old item
+            self.warning(0)
             info = serverfiles.info(item.domain, item.filename)
             new_item = update_item_from_info(item.domain, item.filename,
                                              info, info)
@@ -705,7 +751,7 @@ class OWUpdateGenomicsDatabases(OWWidget):
     def onDeleteWidget(self):
         self.Cancel()
         self.executor.shutdown(wait=False)
-        OWBaseWidget.onDeleteWidget(self)
+        OWWidget.onDeleteWidget(self)
 
     def onDownloadFinished(self):
         # on download completed/canceled/error
@@ -719,11 +765,12 @@ class OWUpdateGenomicsDatabases(OWWidget):
         if not self._tasks:
             # Clear/reset the overall progress
             self.progress.setRange(0, 0)
-
             self.cancelButton.setEnabled(False)
 
     def onDownloadError(self, exc_info):
         sys.excepthook(*exc_info)
+        self.warning(0, "Error while downloading. Check your connection and "
+                        "retry.")
 
     def updateItemIndex(self, domain, filename):
         for i, (item, _, _) in enumerate(self.updateItems):
@@ -739,7 +786,7 @@ class OWUpdateGenomicsDatabases(OWWidget):
                 self.progressBarInit()
 
             self.progressBarSet(self.progress.ratioCompleted() * 100,
-                                processEventsFlags=None)
+                                processEvents=None)
         if rmin == rmax:
             self._haveProgress = False
             self.progressBarFinished()
@@ -840,3 +887,16 @@ class DownloadTask(Task):
                 self.domain, self.filename, callback=self._advance)
         except Exception:
             self.exception.emit(sys.exc_info())
+            raise
+
+
+def main_test():
+    app = QApplication(sys.argv)
+    w = OWDatabasesUpdate()
+    w.show()
+    w.raise_()
+    return w.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main_test())

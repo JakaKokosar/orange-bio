@@ -1,6 +1,5 @@
 import os
 import unittest
-import six
 
 from orangecontrib.bio.kegg import databases
 from orangecontrib.bio.kegg import pathway
@@ -27,8 +26,8 @@ class TestGenome(RemoteResourceTest):
             entry = genome[key]
             self.assertEqual(entry.entry_key, key)
             self.assertIsInstance(entry, genome.ENTRY_TYPE)
-            self.assertIsInstance(entry.name, six.string_types)
-            self.assertIsInstance(entry.taxid, six.string_types)
+            self.assertIsInstance(entry.name, str)
+            self.assertIsInstance(entry.taxid, str)
 
         self.assertTrue(genome.search("homo sapiens")[0] == "hsa")
         entry = genome['hsa']
@@ -53,7 +52,7 @@ class TestGenes(RemoteResourceTest):
             self.assertIsInstance(entry, genes.ENTRY_TYPE)
             self.assertIsInstance(entry.aliases(), list)
 
-            self.assertTrue(all(isinstance(a, six.string_types)
+            self.assertTrue(all(isinstance(a, str)
                                 for a in entry.aliases()))
             all_entries.append(entry)
 

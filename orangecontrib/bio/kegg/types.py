@@ -3,7 +3,6 @@ Return types from api classes interface for the SOAP kegg api.
 
 """
 
-from datetime import datetime
 from collections import namedtuple
 from operator import methodcaller
 

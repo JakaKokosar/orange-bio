@@ -1,9 +1,11 @@
+import numpy
+import math
+
 
 from collections import defaultdict
 from operator import add
 from functools import reduce
-import numpy
-import math
+
 
 def data_type(vals):
     try:
@@ -15,6 +17,7 @@ def data_type(vals):
             return float
         except ValueError:
             return lambda x: x
+
 
 def separate_by(data, separate, ignore=[], consider=None, add_empty=True):
     """
@@ -96,8 +99,10 @@ def separate_by(data, separate, ignore=[], consider=None, add_empty=True):
     
     return ngroups, uniquepos
 
+
 def float_or_none(value):
     return value.value if value.value != "?" else None
+
 
 def linearize(data, ids):
     """ Returns a list of floats in the data subspace (or None's
@@ -107,17 +112,20 @@ def linearize(data, ids):
     l = reduce(add, l)
     return l
 
+
 def pearson_lists(l1, l2):
     """ Returns pearson correlation between two lists. Ignores elements
     which are None."""
     okvals = [ (a,b) for a,b in zip(l1,l2) if a != None and b != None ]
     return numpy.corrcoef([ [ v[0] for v in okvals], [ v[1] for v in okvals] ])[0,1]
 
+
 def euclidean_lists(l1, l2):
     """ Returns pearson correlation between two lists. Ignores elements
     which are None."""
     okvals = [ (a,b) for a,b in zip(l1,l2) if a != None and b != None ]
     return math.sqrt( sum((a-b)*(a-b) for a,b in okvals ))
+
 
 def spearman_lists(l1, l2):
     """ Returns pearson correlation between two lists. Ignores elements
@@ -127,12 +135,15 @@ def spearman_lists(l1, l2):
     #print okvals, len(okvals)
     return scipy.stats.spearmanr([ v[0] for v in okvals], [ v[1] for v in okvals] )[0]
 
+
 def dist_spearman(l1, l2):
     return (1.-spearman_lists(l1, l2))/2
+
 
 def dist_pcorr(l1, l2):
     #normalized to 0..1
     return (1.-pearson_lists(l1, l2))/2
+
 
 def dist_eucl(l1, l2):
     return euclidean_lists(l1, l2)

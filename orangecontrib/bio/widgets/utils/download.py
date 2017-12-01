@@ -1,15 +1,9 @@
 import sys
 import itertools
 
-
-if sys.version_info < (3,):
-    from PyQt4.QtCore import pyqtSignal as Signal
-    from Orange.utils import serverfiles
-    from Orange.OrangeWidgets.OWConcurrent import Task
-else:
-    from AnyQt.QtCore import Signal
-    from ...utils import serverfiles
-    from Orange.widgets.utils.concurrent import Task
+from AnyQt.QtCore import Signal
+from ...utils import serverfiles
+from Orange.widgets.utils.concurrent import Task
 
 
 class EnsureDownloaded(Task):

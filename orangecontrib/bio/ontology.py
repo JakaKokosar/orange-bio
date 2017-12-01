@@ -51,19 +51,9 @@ import keyword
 import operator
 
 from functools import reduce
+from urllib.request import urlopen
 from collections import defaultdict
-
-import six
-
-from six import StringIO
-
-try:
-    from urllib2 import urlopen
-except ImportError:
-    from urllib.request import urlopen
-
-if sys.version_info >= (3,):
-    intern = sys.intern
+from io import StringIO
 
 
 #: These are builtin OBO objects present in any ontology by default.
@@ -242,14 +232,13 @@ class OBOObject(object):
         self.stanza_type = stanza_type
         self.tag_values = []
         self.values = {}
-
         sorted_tags = sorted(
-            six.iteritems(kwargs),
+            kwargs.items(),
             key=lambda key_val: chr(1) if key_val[0] == "id" else key_val[0]
         )
 
         for tag, value in sorted_tags:
-            if isinstance(value, six.string_types):
+            if isinstance(value, str):
                 tag, value, modifiers, comment = \
                     parse_tag_value(name_demangle(tag) + ": " + value)
             elif isinstance(value, tuple):
@@ -350,7 +339,7 @@ class OBOObject(object):
             id: FOO:002 ! This is an id
 
         """
-        tag = intern(tag)  # a small speed and memory benefit
+        tag = sys.intern(tag)  # a small speed and memory benefit
         self.tag_values.append((tag, value, modifiers, comment))
         self.values.setdefault(tag, []).append(value)
 
@@ -628,11 +617,8 @@ class OBOOntology(object):
             An optional function callback to report on the progress.
 
         """
-        if isinstance(file, six.string_types):
-            if six.PY3:
-                file = open(file, "r", encoding="utf-8")
-            else:
-                file = open(file, "rb")
+        if isinstance(file, str):
+            file = open(file, "r", encoding="utf-8")
 
         parser = OBOParser(file)
         current = None
@@ -678,11 +664,8 @@ class OBOOntology(object):
             A file like object.
 
         """
-        if isinstance(stream, six.string_types):
-            if six.PY3:
-                stream = open(stream, "w", encoding="utf-8")
-            else:
-                stream = open(stream, "wb")
+        if isinstance(stream, str):
+            stream = open(stream, "w", encoding="utf-8")
 
         for key, value in self.header_tags:
             stream.write(key + ": " + value + "\n")
@@ -737,7 +720,7 @@ class OBOOntology(object):
             Term id string.
 
         """
-        if isinstance(id, six.string_types):
+        if isinstance(id, str):
             if id in self.id2term:
                 return self.id2term[id]
             elif id in self.alt2id:
@@ -898,125 +881,6 @@ class OBOOntology(object):
         Get the object by it's id `oboid`
         """
         return self.id2term[oboid]
-
-    def to_network(self, terms=None):
-        """
-        Return an Orange.network.Network instance constructed from
-        this ontology.
-
-        """
-        edge_types = self.edge_types()
-        terms = self.terms()
-        from Orange.orng import orngNetwork
-        import orange
-
-        network = orngNetwork.Network(len(terms), True, len(edge_types))
-        network.objects = dict([(term.id, i) for i, term in enumerate(terms)])
-
-        edges = defaultdict(set)
-        for term in self.terms():
-            related = self.related_terms(term)
-            for relType, relTerm in related:
-                edges[(term.id, relTerm)].add(relType)
-
-        edgeitems = edges.items()
-        for (src, dst), eTypes in edgeitems:
-            network[src, dst] = [1 if e in eTypes else 0 for e in edge_types]
-
-        domain = orange.Domain([orange.StringVariable("id"),
-                                orange.StringVariable("name"),
-                                orange.StringVariable("def"),
-                                ], False)
-
-        items = orange.ExampleTable(domain)
-        for term in terms:
-            ex = orange.Example(domain, [term.id, term.name, term.values.get("def", [""])[0]])
-            items.append(ex)
-
-        relationships = set([", ".join(sorted(eTypes)) for (_, _), eTypes in edgeitems])
-        domain = orange.Domain([orange.FloatVariable("u"),
-                                orange.FloatVariable("v"),
-                                orange.EnumVariable("relationship", values=list(edge_types))
-                                ], False)
-
-        id2index = dict([(term.id, i + 1) for i, term in enumerate(terms)])
-        links = orange.ExampleTable(domain)
-        for (src, dst), eTypes in edgeitems:
-            ex = orange.Example(domain, [id2index[src], id2index[dst], eTypes.pop()])
-            links.append(ex)
-
-        network.items = items
-        network.links = links
-        network.optimization = None
-        return network
-
-    def to_networkx(self, terms=None):
-        """
-        Return a NetworkX graph of this ontology.
-        """
-        import networkx
-        graph = networkx.DiGraph()
-
-        edge_types = self.edge_types()
-
-        edge_colors = {"is_a": "red"}
-
-        if terms is None:
-            terms = self.terms()
-        else:
-            terms = [self.term(term) for term in terms]
-            super_terms = [self.super_terms(term) for term in terms]
-            terms = reduce(operator.ior, super_terms, set(terms))
-
-        for term in terms:
-            graph.add_node(term.id, name=term.name)
-
-        for term in terms:
-            for rel_type, rel_term in self.related_terms(term):
-                rel_term = self.term(rel_term)
-                if rel_term in terms:
-                    graph.add_edge(term.id, rel_term.id, label=rel_type,
-                                   color=edge_colors.get(rel_type, "blue"))
-
-        return graph
-
-    def to_graphviz(self, terms=None):
-        """
-        Return an pygraphviz.AGraph representation of the ontology.
-        If `terms` is not `None` it must be a list of terms in the ontology.
-        The graph will in this case contain only the super graph of those
-        terms.
-
-        """
-        import pygraphviz as pgv
-        graph = pgv.AGraph(directed=True, name="ontology")
-
-        edge_types = self.edge_types()
-
-        edge_colors = {"is_a": "red"}
-
-        if terms is None:
-            terms = self.terms()
-        else:
-            terms = [self.term(term) for term in terms]
-            super_terms = [self.super_terms(term) for term in terms]
-            terms = reduce(operator.ior, super_terms, set(terms))
-
-        for term in terms:
-            graph.add_node(term.id, label=term.name)
-
-        for root in self.root_terms():
-            node = graph.get_node(root.id)
-            node.attr["rank"] = "max"
-
-        for term in terms:
-            for rel_type, rel_term in self.related_terms(term):
-                rel_term = self.term(rel_term)
-                if rel_term in terms:
-                    graph.add_edge(term.id, rel_term.id, label=rel_type,
-                                   color=edge_colors.get(rel_type, "blue"))
-
-        return graph
 
 
 def name_mangle(tag):

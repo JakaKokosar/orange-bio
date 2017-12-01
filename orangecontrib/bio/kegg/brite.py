@@ -2,17 +2,12 @@
 KEGG Brite
 
 """
-from __future__ import absolute_import
-
 import os
 import io
 import re
 
-try:
-    from urllib2 import urlopen
-except ImportError:
-    from urllib.request import urlopen
 
+from urllib.request import urlopen
 from . import conf
 
 

@@ -1,26 +1,10 @@
-import unittest
 import tempfile
 import shutil
-
-try:
-    from unittest import mock
-except ImportError:
-    import backports.unittest_mock
-    backports.unittest_mock.install()
-    from unittest import mock
-
-try:
-    from types import SimpleNamespace as namespace
-except ImportError:
-    class namespace(object):
-        def __init__(self, **kwargs): self.__dict__.update(kwargs)
-        def __repr__(self):
-            contents = ",".join("{}={!r}".format(*it)
-                                for it in sorted(self.__dict__.items()))
-            return "namespace(" + contents + ")"
-
 import doctest
 
+
+from unittest import mock
+from types import SimpleNamespace as namespace
 from orangecontrib.bio import kegg
 from orangecontrib.bio.kegg import api as keggapi
 from orangecontrib.bio.kegg import conf as keggconf

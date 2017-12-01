@@ -1,12 +1,6 @@
 """ServerFiles"""
-from __future__ import absolute_import
-
 import serverfiles
 
-try:
-    from Orange.utils import environ
-except ImportError:
-    from . import environ
 
 from orangecontrib.bio.utils import serverfile_path
 

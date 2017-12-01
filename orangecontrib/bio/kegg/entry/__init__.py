@@ -1,11 +1,6 @@
 """
 DBGET entry
 """
-from __future__ import absolute_import
-
-import warnings
-from collections import defaultdict
-
 from . import fields
 from .parser import DBGETEntryParser
 

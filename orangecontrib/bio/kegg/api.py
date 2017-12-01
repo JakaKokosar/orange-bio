@@ -2,16 +2,18 @@
 KEGG api interface.
 
 """
-from __future__ import absolute_import
+import warnings
+import os
 
 from datetime import datetime
 from contextlib import closing
 from operator import itemgetter
-import warnings
-import six
+from functools import lru_cache
 
 from .service import web_service
 from .types import OrganismSummary, Definition, BInfo, Link
+from . import caching
+from .caching import cached_method, cache_entry, touch_dir
 
 
 # A list of all databases with names, abbreviations
@@ -92,7 +94,7 @@ class KeggApi(object):
         """
         Search database 'db' for keywords.
         """
-        if isinstance(keywords, six.string_types):
+        if isinstance(keywords, str):
             keywords = [keywords]
 
         return self.service.find(db)("+".join(keywords)).get()
@@ -101,7 +103,7 @@ class KeggApi(object):
         """
         Retrieve database entries for `ids` list.
         """
-        if not isinstance(ids, six.string_types):
+        if not isinstance(ids, str):
             # Sequence of ids
             ids = "+".join(ids)
 
@@ -113,7 +115,7 @@ class KeggApi(object):
         tuples [(source_id, target_id), ...].
 
         """
-        if not isinstance(source, six.string_types):
+        if not isinstance(source, str):
             source = "+".join(source)
 
         res = self.service.conv(target_db)(source).get()
@@ -331,24 +333,11 @@ class KeggApi(object):
         return _link_targets(self.link("pathway", ids=[pathway_id]))
 
 
+""" KEGG api with caching
 """
-KEGG api with caching
-"""
-
-import os
-
-from . import caching
-from .caching import cached_method, cache_entry, touch_dir
-
-try:
-    from functools import lru_cache
-except ImportError:
-    # TODO: move a copy of lru_cache in .caching if distributing this as a
-    # standalone package
-    from Orange.utils import lru_cache
-
 
 class CachedKeggApi(KeggApi):
+
     def __init__(self, store=None):
         KeggApi.__init__(self)
         if store is None:
@@ -390,7 +379,7 @@ class CachedKeggApi(KeggApi):
 
     @cached_method
     def get(self, ids):
-        if not isinstance(ids, six.string_types):
+        if not isinstance(ids, str):
             return self._batch_get(ids)
         else:
             return KeggApi.get(self, ids)
@@ -643,7 +632,6 @@ class CachedKeggApi(KeggApi):
     @cached_method
     def get_genes_pathway_organism(self, org):
         return KeggApi.get_genes_pathway_organism(self, org)
-
 
 
 def match_by_ids(ids, entries):

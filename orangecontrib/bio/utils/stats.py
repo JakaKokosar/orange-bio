@@ -1,6 +1,5 @@
 import math
 import threading
-import six
 
 
 def _lngamma(z):
@@ -55,6 +54,7 @@ class LogBin(object):
         else:
             return _lngamma(n + 1)
 
+
 class Binomial(LogBin):
     """ `Binomial distribution 
     <http://en.wikipedia.org/wiki/Binomial_distribution>`_ is a discrete
@@ -101,6 +101,7 @@ class Binomial(LogBin):
                 return sum(self.__call__(i, N, m, n) for i in range(k, n+1))
             else:
                 return value
+
 
 class Hypergeometric(LogBin):
     """ `Hypergeometric distribution
@@ -149,8 +150,10 @@ c = [1.0]
 for m in range(2, 100000):
     c.append( c[-1] + 1.0/m)
 
+
 def is_sorted(l):
     return all(l[i] <= l[i+1] for i in range(len(l)-1))
+
 
 def FDR(p_values, dependent=False, m=None, ordered=False):
     """
@@ -195,6 +198,7 @@ def FDR(p_values, dependent=False, m=None, ordered=False):
         fdrs = new
 
     return fdrs
+
 
 def Bonferroni(p_values, m=None):
     """

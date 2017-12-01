@@ -10,7 +10,7 @@ from server_update import *
 from collections import defaultdict
 from urllib.request import urlopen
 from server_update.tests.test_GO import GOTest
-from orangecontrib.bio import obiGO, obiTaxonomy, obiGene
+from orangecontrib.bio import go, gene, taxonomy
 
 
 DOMAIN = 'GO'
@@ -92,7 +92,7 @@ def download_annotations(org, fpath):
     with open(download_path + "/gene_association." + org, 'wb') as outfile:
         outfile.write(decompressed_file.read())
 
-    annos = obiGO.Annotations(outfile.name, genematcher=obiGene.GMDirect())
+    annos = go.Annotations(outfile.name, genematcher=gene.GMDirect())
 
     with open(os.path.join(download_path, "gene_names.pickle"), "wb") as genes_f:
         pickle.dump(annos.gene_names, genes_f)
@@ -120,7 +120,7 @@ if web_ontology_mtime() > sf_ontology_mtime():
     FILENAME = 'gene_ontology_edit.obo.tar.gz'
     TITLE = 'Gene Ontology (GO)'
     TAGS = ['gene', 'ontology', 'GO', 'essential']
-    VERSION = obiGO.Ontology.version
+    VERSION = go.Ontology.version
     file_path = os.path.join(domain_path, FILENAME)
 
     print("donwloading ontology...")
@@ -134,12 +134,12 @@ orgMap = {"352472": "44689", "562": "83333", "3055": None,
           "7955": None, "11103": None, "2104": None, "4754":
           None, "31033": None, "8355": None, "4577": None}
 
-commonOrgs = dict([(obiGO.from_taxid(id), id)
-                   for id in obiTaxonomy.common_taxids()
-                   if obiGO.from_taxid(id) != None])
+commonOrgs = dict([(go.from_taxid(id), id)
+                   for id in taxonomy.common_taxids()
+                   if go.from_taxid(id) != None])
 
-essentialOrgs = [obiGO.from_taxid(id)
-                 for id in obiTaxonomy.essential_taxids()]
+essentialOrgs = [go.from_taxid(id)
+                 for id in taxonomy.essential_taxids()]
 
 exclude = ["goa_uniprot", "goa_pdb", "GeneDB_tsetse", "reactome",
            "goa_zebrafish", "goa_rat", "goa_mouse"]
@@ -166,7 +166,7 @@ for org in list_available_organisms():
 
     # Load the annotations to test them and collect all taxon ids from them
     gene_association = os.path.join(download_path,  "gene_association." + org)
-    a = obiGO.Annotations(gene_association, genematcher=obiGene.GMDirect())
+    a = go.Annotations(gene_association, genematcher=gene.GMDirect())
     taxons = set([ann.Taxon for ann in a.annotations])
 
     # exclude taxons with cardinality 2
@@ -176,15 +176,15 @@ for org in list_available_organisms():
         updatedTaxonomy[taxid].add(org)
     del a
 
-    orgName = obiTaxonomy.name(commonOrgs[org])
-    taxid = obiTaxonomy.taxname_to_taxid(orgName)
+    orgName = taxonomy.name(commonOrgs[org])
+    taxid = taxonomy.taxname_to_taxid(orgName)
 
     TITLE = "GO Annotations for " + orgName
     TAGS = ["gene", "annotation", "ontology", "GO", orgName] + \
-           (["essential"] if org in essentialOrgs else []) + obiTaxonomy.shortname(taxid)
+           (["essential"] if org in essentialOrgs else []) + taxonomy.shortname(taxid)
 
     ORGANISM = orgName
-    VERSION = obiGO.Annotations.version
+    VERSION = go.Annotations.version
 
     create_info_file(FILE_PATH, title=TITLE, tags=TAGS, version=VERSION,
                      uncompressed=uncompressedSize(FILE_PATH), compression='tar.gz')
@@ -207,7 +207,7 @@ except FileNotFoundError as e:
 tax_path = os.path.join(domain_path, 'taxonomy.pickle')
 TITLE = 'GO taxon IDs'
 TAGS = ["GO", "taxon", "organism", "essential"]
-VERSION = obiGO.Taxonomy.version
+VERSION = go.Taxonomy.version
 
 if any(tax.get(key, set()) != updatedTaxonomy.get(key, set()) for key in set(updatedTaxonomy)):
     print("takonomy was updated!")

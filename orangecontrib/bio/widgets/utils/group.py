@@ -3,14 +3,12 @@ from collections import defaultdict, namedtuple
 from xml.sax.saxutils import escape
 
 import numpy
-
 from AnyQt import QtGui
 from AnyQt.QtCore import Qt
 
 import Orange.data
 from Orange.widgets import gui
-
-from . import gui as guiutils
+from orangecontrib.bio.widgets.utils import gui as guiutils
 
 ColumnGroup = namedtuple("ColumnGroup", ["name", "key", "values"])
 RowGroup = namedtuple("RowGroup", ["name", "var", "values"])

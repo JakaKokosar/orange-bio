@@ -3,53 +3,32 @@ Gene Ontology (:mod:`go`)
 =========================
 
 """
-
-from __future__ import absolute_import
-
 import os
 import tarfile
 import gzip
 import re
 import sys
 import six
-
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
-
+import pickle
 import shutil
-
-try:
-    from urllib2 import urlopen
-except ImportError:
-    from urllib.request import urlopen
-    
 import warnings
 
 from gzip import GzipFile
 from collections import defaultdict
 from operator import attrgetter
+from urllib.request import urlopen
 
 from orangecontrib.bio.utils import progress_bar_milestones
 
-try:
-    from Orange.utils import environ
-except ImportError:
-    from orangecontrib.bio.utils import environ
-
-try:
-    basestring
-    intern
-except NameError:
-    basestring = str
-    intern = sys.intern
-
+from orangecontrib.bio.utils import environ
 from orangecontrib.bio.utils import serverfiles
 from orangecontrib.bio.utils import stats
 
-from orangecontrib.bio import gene as obiGene, taxonomy as obiTaxonomy
+from orangecontrib.bio import gene, taxonomy
 
+
+basestring = str
+intern = sys.intern
 default_database_path = os.path.join(serverfiles.localpath(), "GO")
 
 _CVS_REVISION_RE = re.compile(r"^(rev)?(\d+\.\d+)+$")
@@ -703,14 +682,14 @@ class Annotations(object):
             self.parse_file(filename_or_organism, progress_callback)
 
         if not self.genematcher and self.taxid:
-            matchers = [obiGene.GMGO(self.taxid)]
+            matchers = [gene.GMGO(self.taxid)]
             if self.taxid == "352472":
                 matchers.extend(
-                    [obiGene.GMDicty(),
-                     [obiGene.GMGO(self.taxid), obiGene.GMDicty()]]
+                    [gene.GMDicty(),
+                     [gene.GMGO(self.taxid), gene.GMDicty()]]
                 )
 
-            self.genematcher = obiGene.matcher(matchers)
+            self.genematcher = gene.matcher(matchers)
 
         if self.genematcher:
             self.genematcher.set_targets(self.gene_names)
@@ -779,7 +758,7 @@ class Annotations(object):
             sf = serverfiles.ServerFiles()
             available = [fname for domain, fname in sf.listfiles("GO")]
             if filename not in available:
-                raise obiTaxonomy.UnknownSpeciesIdentifier(org + str(code))
+                raise taxonomy.UnknownSpeciesIdentifier(org + str(code))
             serverfiles.download("GO", filename)
 
         return cls(path, ontology=ontology, genematcher=genematcher,
@@ -1141,7 +1120,7 @@ class Annotations(object):
                 for name in map[gene]:
                     ann1 = ann._replace(DB_Object_Symbol=name)
                     self.add(ann1)
-        self.genematcher = obiGene.GMDirect()
+        self.genematcher = gene.GMDirect()
         self._gene_names = None
         self.genematcher.set_targets(self.gene_names)
 
@@ -1175,7 +1154,7 @@ class Annotations(object):
         tFile.add(os.path.join(tmpDir, "gene_association." + org),
                   "gene_association")
         annotation = Annotations(os.path.join(tmpDir, "gene_association." + org),
-                    genematcher=obiGene.GMDirect(), progress_callback=progress_callback)
+                    genematcher=gene.GMDirect(), progress_callback=progress_callback)
         pickle.dump(annotation.gene_names, open(os.path.join(tmpDir, "gene_names.pickle"), "wb"))
         tFile.add(os.path.join(tmpDir, "gene_names.pickle"), "gene_names.pickle")
         tFile.close()
