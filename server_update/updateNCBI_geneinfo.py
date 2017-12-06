@@ -62,8 +62,8 @@ for taxid, genes in genes.items():
         create_info_file(filename, title="NCBI gene history for %s" % taxonomy.name(taxid), tags=TAGS_HIST)
         print("{}.info file created".format(filename))
 
-helper = SyncHelper(DOMAIN, NCBIGeneInfoTest)
-helper.run_tests()
-helper.sync_files()
+#helper = SyncHelper(DOMAIN, NCBIGeneInfoTest)
+#helper.run_tests()
+#helper.sync_files()
 
-helper.remove_update_folder()
+#helper.remove_update_folder()
