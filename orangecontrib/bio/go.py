@@ -24,8 +24,8 @@ from orangecontrib.bio.utils import environ
 from orangecontrib.bio.utils import serverfiles
 from orangecontrib.bio.utils import stats
 
-from orangecontrib.bio import gene, taxonomy
-
+from orangecontrib.bio import gene
+from orangecontrib.bio.ncbi import taxonomy
 
 basestring = str
 intern = sys.intern
@@ -697,7 +697,7 @@ class Annotations(object):
     @classmethod
     def organism_name_search(cls, org):
         ids = to_taxid(org)
-        from orangecontrib.bio import taxonomy as tax
+        from orangecontrib.bio.ncbi import taxonomy as tax
         if not ids:
             ids = [org] if org in Taxonomy().common_org_map or \
                 org in Taxonomy().code_map.keys() else []
@@ -1182,11 +1182,7 @@ class Annotations(object):
 
     DownloadAnnotationsAtRev = download_annotations_at_rev
 
-from orangecontrib.bio.taxonomy import pickled_cache
 
-
-@pickled_cache(None, [("GO", "taxonomy.pickle"),
-                      ("Taxonomy", "ncbi_taxonomy.tar.gz")])
 def organism_name_search(name):
     return Annotations.organism_name_search(name)
 

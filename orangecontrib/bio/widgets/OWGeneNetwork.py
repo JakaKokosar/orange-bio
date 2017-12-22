@@ -14,7 +14,8 @@ from Orange.widgets.utils.concurrent import ThreadExecutor, Task, methodinvoke
 
 from orangecontrib import network
 
-from orangecontrib.bio import ppi, taxonomy, gene
+from orangecontrib.bio import ppi, gene
+from orangecontrib.bio.ncbi import taxonomy
 from orangecontrib.bio.utils import serverfiles, compat
 
 
@@ -340,7 +341,7 @@ def fetch_ppidb(ppisource, taxid, progress=None):
 def fetch_ncbi_geneinfo(taxid, progress=None):
     taxid = gene.NCBIGeneInfo.TAX_MAP.get(taxid, taxid)
     serverfiles.localpath_download(
-        "NCBI_geneinfo", "gene_info.{taxid}.db".format(taxid=taxid),
+        "NCBI_geneinfo", "gene.{taxid}.db".format(taxid=taxid),
         callback=progress, verbose=True,
     )
     return gene.NCBIGeneInfo(taxid)

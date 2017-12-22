@@ -33,8 +33,8 @@ from Orange.widgets.utils.messages import UnboundMsg
 from Orange.widgets import widget, gui, settings
 from Orange.widgets.utils.concurrent import ThreadExecutor, Task, methodinvoke
 
-from orangecontrib.bio import gene, geneset, taxonomy, utils
-
+from orangecontrib.bio import gene, geneset, utils
+from orangecontrib.bio.ncbi import taxonomy
 from orangecontrib.bio.widgets.utils.download import EnsureDownloaded
 
 
@@ -367,7 +367,7 @@ class OWSetEnrichment(widget.OWWidget):
         self.setBlocking(True)
 
         task = EnsureDownloaded(
-            [(taxonomy.Taxonomy.DOMAIN, taxonomy.Taxonomy.FILENAME),
+            [(taxonomy.DOMAIN, taxonomy.FILENAME),
              (geneset.sfdomain, "index.pck")]
         )
 

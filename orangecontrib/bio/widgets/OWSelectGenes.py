@@ -35,7 +35,7 @@ from Orange.widgets.utils.concurrent import (
 from Orange.widgets.utils.itemmodels import VariableListModel
 from Orange.widgets.utils.datacaching import data_hints
 
-from orangecontrib.bio import taxonomy
+from orangecontrib.bio.ncbi import taxonomy
 from orangecontrib.bio import gene as geneinfo
 
 

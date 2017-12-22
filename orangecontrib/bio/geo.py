@@ -10,8 +10,7 @@ from collections import defaultdict
 from Orange.data import DiscreteVariable, ContinuousVariable, StringVariable, Domain, Table
 from .utils import serverfiles
 from .utils import compat
-from . import taxonomy
-
+from orangecontrib.bio.ncbi import taxonomy
 
 def spots_mean(x):
     vs = [v for v in x if not compat.isunknown(v)]

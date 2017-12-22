@@ -54,7 +54,8 @@ from collections import defaultdict
 from itertools import chain
 from contextlib import contextmanager
 
-from orangecontrib.bio import utils, taxonomy
+from orangecontrib.bio import utils
+from orangecontrib.bio.ncbi import taxonomy
 from orangecontrib.bio.utils import progress_bar_milestones
 from orangecontrib.bio.kegg import databases
 from orangecontrib.bio.kegg import entry

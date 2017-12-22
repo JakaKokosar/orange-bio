@@ -7,11 +7,11 @@ import re
 
 from urllib.request import urlopen
 from collections import defaultdict
-
+from orangecontrib.bio.ncbi import taxonomy
 from ..utils import serverfiles
 from ..utils import environ
 from .. import dicty
-from .. import go, omim, kegg, taxonomy
+from .. import go, omim, kegg
 
 
 sfdomain = "gene_sets"

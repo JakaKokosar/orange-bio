@@ -30,7 +30,8 @@ from Orange.widgets.utils.concurrent import ThreadExecutor
 
 from requests.exceptions import ConnectTimeout
 
-from orangecontrib.bio import gene, go, taxonomy
+from orangecontrib.bio import gene, go
+from orangecontrib.bio.ncbi import taxonomy
 from orangecontrib.bio.utils import serverfiles
 from orangecontrib.bio.utils import stats
 from orangecontrib.bio.widgets.utils.download import EnsureDownloaded
@@ -292,7 +293,7 @@ class OWGOEnrichmentAnalysis(widget.OWWidget):
         self.setBlocking(True)
         self._executor = ThreadExecutor()
         self._init = EnsureDownloaded(
-            [(taxonomy.Taxonomy.DOMAIN, taxonomy.Taxonomy.FILENAME),
+            [(taxonomy.DOMAIN, taxonomy.FILENAME),
              ("GO", "taxonomy.pickle")]
         )
         self._init.finished.connect(self.__initialize_finish)

@@ -3,7 +3,7 @@ import time
 import zlib
 import sqlite3
 import socket
-
+import ssl
 import pickle
 
 from functools import reduce
@@ -12,18 +12,12 @@ from urllib.request import urlopen
 from urllib.parse import urlencode
 from urllib.error import HTTPError
 
-try:
-    #for 2.7.9+ and 3.4.3+
-    import ssl
-    CONTEXT = ssl._create_unverified_context()
-except AttributeError:
-    CONTEXT = None
-
-
+from Orange.data import ContinuousVariable, StringVariable
 from ..utils.compat import *
 from ..utils import serverfiles
 from . import phenotypes
 
+CONTEXT = ssl._create_unverified_context()
 
 defaddress = "http://bcm.fri.uni-lj.si/microarray/api/index.php?"
 defaddresspipa = "https://pipa.fri.uni-lj.si/PIPA/PIPAapi/PIPAorange.py"
@@ -32,7 +26,8 @@ defaddresspipa_coverage = "https://pipa.biolab.si/tbrowse/api/pipa.py"
 pipaparuser = "pipa_username"
 pipaparpass = "pipa_password"
 
-#utility functions - from Marko's mMisc.py
+# utility functions - from Marko's mMisc.py
+
 
 def splitN(origsize, maxchunk):
     """
@@ -45,6 +40,7 @@ def splitN(origsize, maxchunk):
     if a > 0: 
         l.append(a)
     return l
+
 
 def split(l, maxchunk):
     """
@@ -59,6 +55,7 @@ def split(l, maxchunk):
         tillNow += s
     return out       
 
+
 def lloc(l,n):
     """
     List location in list of list structure.
@@ -69,6 +66,7 @@ def lloc(l,n):
         return len(l[0])+n
     else:
         return n
+
 
 def loc(l,n):
     """
@@ -81,12 +79,14 @@ def loc(l,n):
     else:
         return n
 
+
 def nth(l,n):
     """
     Returns only nth elemnt in a list.
     """
     n = lloc(l,n)
     return [ a[n] for a in l ]
+
 
 def imnth(l, ns):
     """
@@ -127,7 +127,7 @@ def issequencens(x):
     """
     return hasattr(x, '__getitem__') and not isinstance(x, str)
 
-#end utility functions
+# end utility functions
 
 
 def median(l):
@@ -140,20 +140,21 @@ socket.setdefaulttimeout(60)
 
 verbose = 0
 
+
 class HttpGetException(Exception): pass
+
 
 def replaceChars(address):
     return address.replace(" ", "%20")
+
 
 def httpGet(address, *args, **kwargs):
     if verbose: 
         print(address, args, kwargs,  " ")
     address = replaceChars(address)
     t1 = time.time()
-    if CONTEXT is not None:
-        f = urlopen(address, *args, context=CONTEXT, **kwargs)
-    else:  # to work before 2.7.9
-        f = urlopen(address, *args,  **kwargs)
+    f = urlopen(address, *args, context=CONTEXT, **kwargs)
+
 
     read = f.read()
     if verbose:
@@ -167,8 +168,10 @@ def httpGet(address, *args, **kwargs):
 def txt2ll(s, separ=' ', lineSepar='\n'):
     return [ a.split(separ) for a in s.split(lineSepar) ]
 
+
 class AuthenticationError(Exception):
     pass
+
 
 class DBInterface(object):
  
@@ -223,9 +226,6 @@ class DBInterface(object):
             a = a[:-1]
         return a
 
-def _test():
-    import doctest
-    doctest.testmod()
 
 def splitTableOnColumn(ll,n):
     omap = {}
@@ -236,11 +236,14 @@ def splitTableOnColumn(ll,n):
         omap[l[n]] = cell
     return omap
 
+
 def neededColumns(legend, want):
     return [ legend.index(a) for a in want ]
 
+
 def onlyColumns(ll, legend, want):
     return list(imnth(ll, neededColumns(legend, want)))
+
 
 def ll2dic(ll, key=0, value=1):
     """
@@ -252,6 +255,7 @@ def ll2dic(ll, key=0, value=1):
     else:
         raise Exception("all keys are not unique")
 
+
 def dic2ll(dic):
 
     columns = sorted(dic.values()[0].keys())
@@ -260,8 +264,10 @@ def dic2ll(dic):
         ll.append([ key ] + [ d[a] for a in columns ])
     return columns,ll
 
+
 def allUnique(els):
     return len(els) == len(set(els))
+
 
 def reverseDic(d):
     """
@@ -269,6 +275,7 @@ def reverseDic(d):
     """
     if allUnique(d.values()):
         return dict([ (b,a) for a,b in d.items() ])
+
 
 def chainLookup(a, dics, force=[]):
     """
@@ -285,6 +292,7 @@ def chainLookup(a, dics, force=[]):
             if a in dic:
                 a = dic[a]
     return a
+
 
 class DBCommon(object):
 
@@ -549,6 +557,7 @@ def example_tables(ids, chipsm=None, spotmap={}, callback=None, exclude_constant
 
     return et
 
+
 def bufferkeypipax(command, data):
     """ Do not save password to the buffer! """
     command = command + " v8" #add version
@@ -743,7 +752,7 @@ Can only retrieve a single result_template_type at a time"""
         cbc.end()
 
         # Restore input ids order.
-        domain = create_domain([et.domain[id] for id in ids], None, et.domain.metas if OR3 else et.domain.getmetas().values())
+        domain = create_domain([et.domain[id] for id in ids], None, et.domain.metas)
         et = Orange.data.Table(domain, et)
         
         cbc = CallBack(2, optcb, callbacks=10)
@@ -918,7 +927,7 @@ chips chips""")
         return o
 
     def geneInfo(self):
-        res,legend = self.sq("action=gene_info")
+        res,legend = self.sq("action=gene")
         return res, legend
 
     def annotationOptions(self, ao=None, onlyDiff=False, **kwargs):
@@ -966,7 +975,6 @@ chips chips""")
         else:
             return [ [ a,b ] for a,b in annot \
                 if self.meaningfulAnnot(a) ]
-
 
     def annotations(self, type, ids=None, all=False):
         """
@@ -1049,7 +1057,6 @@ chips chips""")
 
         return sorted(set(nth(ares, 0)))
 
-
     def chipN(self, id):
         return list(self.chipNs([id]))[0]
 
@@ -1127,7 +1134,7 @@ chips chips""")
                 yield a
 
     def chipRs(self, id):
-        antss = self.downloadMulti("action=get_raw_data&ids=$MULTI$", ids, chunk=2)
+        antss = self.downloadMulti("action=get_raw_data&ids=$MULTI$", id, chunk=2)
         for a,legend in antss:
             yield a
   
@@ -1174,9 +1181,6 @@ chips chips""")
                 spotmapd[a] = b
 
         return spotmapd
-
-    def getData(self, *args, **kwargs):
-        deprecatedError("Use get_single_data instead")
 
     def get_data(self, type="norms", exclude_constant_labels=False, average=median, 
         ids=None, callback=None, format="short", transform=None, allowed_labels=None, **kwargs):
@@ -1279,8 +1283,10 @@ chips chips""")
     def get_single_data(self, *args, **kwargs):
         return self.get_data(*args, **kwargs)
 
+
 class DatabaseConnection(DictyExpress):
     pass
+
 
 def allAnnotationVals(annots):
     """
@@ -1292,6 +1298,7 @@ def allAnnotationVals(annots):
         for name,val in a:
             av[name].add(val)
     return av
+
 
 def createExampleTable(names, vals, annots, ddb, cname="DDB", \
         exclude_constant_labels=False, permutation=None, always_include=["id"], allowed_labels=None):
@@ -1334,6 +1341,7 @@ def createExampleTable(names, vals, annots, ddb, cname="DDB", \
 
     return data
 
+
 def transformValues(data, fn):
     """
     In place transformation.
@@ -1342,6 +1350,7 @@ def transformValues(data, fn):
         for at in data.domain.attributes:
             if ex[at].value != NAN:
                 ex[at] = fn(ex[at])
+
 
 def averageAttributes(data, joinc="DDB", fn=median):
     """
@@ -1388,6 +1397,7 @@ def averageAttributes(data, joinc="DDB", fn=median):
 
     return create_table(domain, examples, None, metas)
 
+
 def floatOrUnknown(a):
     """
     Converts an element to float if possible.
@@ -1397,6 +1407,7 @@ def floatOrUnknown(a):
         return float(a)
     except:
         return "?"
+
 
 def encode_unknown(a):
     """
@@ -1436,6 +1447,7 @@ class CallBack():
         while self.cbs < self.callbacks:
             self.fn()
             self.cbs += 1
+
 
 class CacheSQLite(object):
     """
@@ -1538,12 +1550,10 @@ class CacheSQLite(object):
             print(time.time() - t)
         return rc
 
+
 def download_url(url, repeat=2):
     def do():
-        if CONTEXT is not None:  # to work before Python 2.7.9
-            return urlopen(url, context=CONTEXT)
-        else:
-            return urlopen(url)
+        return urlopen(url, context=CONTEXT)
 
     if repeat <= 0:
         do()
@@ -1553,11 +1563,13 @@ def download_url(url, repeat=2):
         except:
             return download_url(url, repeat=repeat-1)
 
+
 def empty_none(s):
     if s:
         return s
     else:
         return None
+
 
 def join_ats(atts, fnshow=None):
     """ Joins attribute attributes together. If all values are the same,
@@ -1582,6 +1594,7 @@ def join_ats(atts, fnshow=None):
             else:
                 od[k] = fnshow([ at[k] for at in atts ])
     return od
+
 
 def join_replicates(data, ignorenames=["replicate", "id", "name", "map_stop1"], namefn=None, avg=median, fnshow=None):
     """ Join replicates by median. 
@@ -1667,19 +1680,11 @@ def join_replicates(data, ignorenames=["replicate", "id", "name", "map_stop1"], 
             atdic2 = join_ats([ { "id": data.domain.attributes[i].name} for i in elements], fnshow=fnshow)
             aname = namefndef(atdic2)
 
-        a = None
-
-        if not OR3:
-            a = ContinuousVariable(name=aname)
-            def avgel(ex, el):
-                return Orange.data.Value(avgnone([ nativeOrNone(ex[ind]) for ind in el ]))
-            a.getValueFrom = lambda ex,rw,el=elements: avgel(ex,el)
-        else:
-            a = ContinuousVariable(name=aname, compute_value=lambda d,el=elements: numpy.nanmedian(data[:,el], axis=1))
+        a = ContinuousVariable(name=aname, compute_value=lambda d,el=elements: numpy.nanmedian(data[:,el], axis=1))
         a.attributes.update(atdic)
         natts.append(a)
 
-    ndom = create_domain(natts, data.domain.class_var, data.domain.metas if OR3 else data.domain.get_metas().values())
+    ndom = create_domain(natts, data.domain.class_var, data.domain.metas)
     return Orange.data.Table(ndom, data)
 
 
@@ -1741,6 +1746,7 @@ class DictyBase(object):
     def __init__(self):
         fn = serverfiles.localpath_download(self.domain, self.filename)
         self.info, self.mappings = pickle.load(open(fn, 'rb'))
+
 
 if __name__=="__main__":
     verbose = 1

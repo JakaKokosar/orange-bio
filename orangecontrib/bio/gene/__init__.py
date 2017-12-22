@@ -8,7 +8,8 @@ from urllib.request import urlopen
 from functools import reduce
 
 from ..utils import serverfiles, environ
-from .. import taxonomy, kegg, dicty, biomart
+from .. import kegg, dicty, biomart
+from ..ncbi import taxonomy
 from . import homology
 
 default_database_path = serverfiles.localpath("NCBI_geneinfo")
@@ -27,7 +28,7 @@ class GeneInfo(object):
     __slots__ = NCBI_GENEINFO_TAGS
 
     def __init__(self, line):
-        """ Construct the GeneInfo object from a line in the NCBI gene_info file
+        """ Construct the GeneInfo object from a line in the NCBI gene file
         """
         line = line.split("\t")
         for attr, value in zip(self.__slots__, line):
@@ -109,7 +110,7 @@ class NCBIGeneInfo(dict):
     def organism_version(cls, name):
         oname = cls.organism_name_search(name)
         #FIXME, dirty hack to ensure file id downloaded
-        serverfiles.localpath_download("NCBI_geneinfo", "gene_info.%s.db" % oname) 
+        serverfiles.localpath_download("NCBI_geneinfo", "gene_info.%s.db" % oname)
         return serverfiles.info("NCBI_geneinfo", "gene_info.%s.db" % oname)["datetime"]
 
     @classmethod
@@ -197,7 +198,7 @@ class NCBIGeneInfo(dict):
         if isinstance(file, str):
             file = open(file, "wb")
         
-        stream = urlopen("ftp://ftp.ncbi.nih.gov/gene/DATA/gene_info.gz")
+        stream = urlopen("ftp://ftp.ncbi.nih.gov/gene/DATA/gene.gz")
         tmpfile = tempfile.TemporaryFile()
         shutil.copyfileobj(stream, tmpfile)
         tmpfile.seek(0)

@@ -14,7 +14,7 @@ from collections import namedtuple
 from operator import itemgetter
 
 from .utils import serverfiles
-from . import taxonomy
+from orangecontrib.bio.ncbi import taxonomy
 
 
 def wget(url, dst_obj=None, progress=None):  # FIXME ugly fix so update scripts work with py3

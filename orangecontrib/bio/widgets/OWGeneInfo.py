@@ -31,7 +31,8 @@ from Orange.widgets.utils.concurrent import \
     ThreadExecutor, Task, methodinvoke
 
 
-from orangecontrib.bio import gene, taxonomy
+from orangecontrib.bio import gene
+from orangecontrib.bio.ncbi import taxonomy
 
 
 def ensure_downloaded(domain, filename, advance=None):
@@ -121,7 +122,7 @@ def ncbi_info(taxid, genes, advance=None):
     taxid = gene.NCBIGeneInfo.TAX_MAP.get(taxid, taxid)
     ensure_downloaded(
         "NCBI_geneinfo",
-        "gene_info.%s.db" % taxid,
+        "gene.%s.db" % taxid,
         advance
     )
     info = get_ncbi_info(taxid)
@@ -331,6 +332,12 @@ class OWGeneInfo(widget.OWWidget):
                  serverfiles.listfiles("NCBI_geneinfo")] +
                 gene.NCBIGeneInfo.common_taxids())
         )
+
+        self.organisms.remove('559292')
+        self.organisms.remove('36329')
+        self.organisms.remove('272634')
+        self.organisms.remove('39947')
+
 
         self.organismComboBox.addItems(
             [taxonomy.name(tax_id) for tax_id in self.organisms]

@@ -36,8 +36,8 @@ from orangecontrib.bio import kegg
 from orangecontrib.bio import geneset
 from orangecontrib.bio.utils import stats
 
-from .OWMapManOntology import relation_list_to_multimap
-
+#from .OWMapManOntology import relation_list_to_multimap
+from orangecontrib.bio.widgets.OWMapManOntology import relation_list_to_multimap
 
 def split_and_strip(string, sep=None):
     return [s.strip() for s in string.split(sep)]
